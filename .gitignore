@@ -1,0 +1,6 @@
+# 대용량·기계 산출물은 레포 밖 (우산 README §2)
+runs/
+*.log
+*.pt
+__pycache__/
+*.pyc
