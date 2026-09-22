@@ -53,13 +53,14 @@ def t_sf(t, df):
 
 cells = {}
 for npz in sorted(ROOT.glob("runs/stress/*/per_env.npz")):
-    m = re.match(r"(.+?)__(.+?)__tau(\d+)__m([0-9.]+)__g([0-9.]+)__seed(\d+)$", npz.parent.name)
+    m = re.match(r"(.+?)__(.+?)__tau(\d+)__m([0-9.]+)__g([0-9.]+)(?:__(pre|grasp|post|all))?__seed(\d+)$", npz.parent.name)
     if not m:
         continue
     sr, d = per_object_sr(npz)
     cells[npz.parent.name] = dict(
         ckpt=m.group(1), objset=m.group(2), tau=int(m.group(3)),
-        mass=float(m.group(4)), ext_g=float(m.group(5)), seed=int(m.group(6)), sr=sr)
+        mass=float(m.group(4)), ext_g=float(m.group(5)),
+        phase=(m.group(6) or "post"), seed=int(m.group(7)), sr=sr)
 
 out, md = {}, ["# 물체 단위 paired 판정 (PROTOCOL §5)", "",
                "| cell | n | SR | SR(기준) | ΔSR | t | p | 판정 |", "|---|---|---|---|---|---|---|---|"]

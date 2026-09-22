@@ -3,9 +3,9 @@
 set -uo pipefail
 GPU="${1:?}"; CELLS="${2:?}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-while read -r ckpt objset tau seed nenv mass extg; do
+while read -r ckpt objset tau seed nenv mass extg phase dose; do
   [ -z "${ckpt:-}" ] && continue
   case "$ckpt" in \#*) continue;; esac
-  GS_GPU="$GPU" bash "$HERE/12_stress.sh" "$ckpt" "$objset" "$tau" "$seed" "$nenv" "$mass" "$extg" 2>&1 | tail -1
+  GS_GPU="$GPU" bash "$HERE/12_stress.sh" "$ckpt" "$objset" "$tau" "$seed" "$nenv" "$mass" "$extg" "${phase:-post}" "${dose:-0}" 2>&1 | tail -1
 done < "$CELLS"
 echo "[stress gpu$GPU] ALL DONE"

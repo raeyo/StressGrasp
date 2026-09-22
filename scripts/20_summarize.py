@@ -22,16 +22,18 @@ for log in sorted(ROOT.glob("runs/*/*/eval.log")):
     srs = rounds(log)
     if len(srs) < 10:
         continue
-    m = re.match(r"(.+?)__(.+?)__tau(\d+)__m([0-9.]+)__g([0-9.]+)__seed(\d+)$", name)
+    m = re.match(r"(.+?)__(.+?)__tau(\d+)__m([0-9.]+)__g([0-9.]+)(?:__(pre|grasp|post|all))?__seed(\d+)$", name)
     if m:
-        ck, obj, tau, mass, extg, seed = m.group(1), m.group(2), int(m.group(3)), float(m.group(4)), float(m.group(5)), int(m.group(6))
+        ck, obj, tau, mass, extg = m.group(1), m.group(2), int(m.group(3)), float(m.group(4)), float(m.group(5))
+        phase, seed = (m.group(6) or "post"), int(m.group(7))
     else:
         m = re.match(r"(.+?)__(.+?)__tau(\d+)__seed(\d+)$", name)
         if not m:
             continue
-        ck, obj, tau, mass, extg, seed = m.group(1), m.group(2), int(m.group(3)), 1.0, 0.0, int(m.group(4))
+        ck, obj, tau, mass, extg = m.group(1), m.group(2), int(m.group(3)), 1.0, 0.0
+        phase, seed = "post", int(m.group(4))
     cells.append(dict(axis=axis, cell=name, ckpt=ck, objset=obj, tau=tau, mass=mass,
-                      ext_g=extg, seed=seed, n=len(srs), sr=sum(srs)/len(srs),
+                      ext_g=extg, phase=phase, seed=seed, n=len(srs), sr=sum(srs)/len(srs),
                       round_std=statistics.pstdev(srs)))
 
 if not cells:
@@ -70,7 +72,10 @@ md = ["# Stage 0 — 낙폭 측정 요약", "",
 md += tbl(lambda c: c["mass"] == 1 and c["ext_g"] == 0, "D1 유지 시간", "tau (step / s)",
           lambda c: f"{c['tau']} / {c['tau']*STEP_S:.1f}s")
 md += tbl(lambda c: c["mass"] != 1, "D2 하중 (질량 배율)", "mass x", lambda c: c["mass"])
-md += tbl(lambda c: c["ext_g"] != 0, "D3 운동 (파지 후 외력)", "ext_g (무게 배수)", lambda c: c["ext_g"])
+PH_KO = {"pre": "전", "grasp": "중", "post": "후"}
+for ph in ("pre", "grasp", "post"):
+    md += tbl(lambda c, ph=ph: c["ext_g"] != 0 and c["phase"] == ph,
+              "D3 외력 — 파지 " + PH_KO[ph], "ext_g (무게 배수)", lambda c: c["ext_g"])
 md += ["", "## 판정 (PROTOCOL §5)", ""]
 ds = [c["delta"] for c in cells if c["delta"] is not None]
 mx = max(ds) if ds else 0.0

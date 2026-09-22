@@ -21,8 +21,16 @@ import os
 _MASS = float(os.environ.get("GS_MASS_SCALE", "1") or 1)
 _EXTG = float(os.environ.get("GS_EXT_G", "0") or 0)
 _MODE = os.environ.get("GS_FORCE_MODE", "planar")
+_PHASE = os.environ.get("GS_PHASE", "post")   # pre | grasp | post | all — 외란을 거는 시점
+# ★ 투여량(dose) 통제: 시점 진입 후 몇 **env-step** 동안 힘을 거는가. 0 = 무제한(옛 동작).
+#   시점마다 지속시간이 다르면 (pre 는 파지가 안 되면 영원히 지속) 시점 간 비교가 불가능하다.
+_FSTEPS = int(os.environ.get("GS_FORCE_STEPS", "0") or 0)
+# ★ 파지 전 외란 전용 계측기: 물체를 cm 단위로 **한 번** 옮긴다.
+#   자유 물체에 일정한 힘을 걸면 가속도가 무한정이라(5g x 3.3s = 267 m) 정보가 없다.
+#   one-shot 정책의 구조적 질문은 "t=0 계획이 몇 cm 의 물체 위치 오차를 견디는가" 다.
+_SHIFT = float(os.environ.get("GS_OBJ_SHIFT", "0") or 0) / 100.0   # cm -> m
 _DUMP = os.environ.get("GS_DUMP", "")
-_ACTIVE = (_MASS != 1.0) or (_EXTG != 0.0) or bool(_DUMP)
+_ACTIVE = (_MASS != 1.0) or (_EXTG != 0.0) or (_SHIFT != 0.0) or bool(_DUMP)
 
 
 def _wrap(Grasp):
@@ -57,9 +65,38 @@ def _wrap(Grasp):
         self._gs_force = torch.zeros((self._gs_n_rb, 3), dtype=torch.float, device=self.device)
         self._gs_dir = None
         self._gs_applied = 0
-        print("[gs] mass x%.3g (obj mass mean %.4f kg) | ext_g %.3g (%s) | envs %d"
-              % (_MASS, self._gs_obj_mass.mean().item(), _EXTG, _MODE, self.num_envs), flush=True)
+        self._gs_shifted = 0
+        print("[gs] mass x%.3g (obj mass mean %.4f kg) | ext_g %.3g (%s, phase=%s) | envs %d"
+              % (_MASS, self._gs_obj_mass.mean().item(), _EXTG, _MODE,
+                 _PHASE + ("" if _FSTEPS == 0 else "/%dstep" % _FSTEPS), self.num_envs), flush=True)
+        if _SHIFT != 0.0:
+            print("[gs] object shift %.1f cm (계획 확정 직후 1회)" % (_SHIFT * 100), flush=True)
         return out
+
+    def _gs_phase_mask(self):
+        """외란을 걸 시점 마스크. ★ 성공 판정식(reward.py:reward_binary)이 쓰는 값을
+        그대로 재계산해서 쓴다 — 별도 기준을 만들면 "언제부터 파지인가"가 어긋난다.
+
+          pre   : 손이 아직 물체 근처가 아님        (flag == False)
+          grasp : 손은 닿았고 아직 안 들림          (flag & delta_z <= 0.1)
+          post  : 들림                              (delta_z > 0.1)
+        """
+        obj = self.object_pos
+        delta_z = obj[:, 2] - self.object_init_states[:, 2]
+        palm_d = torch.norm(obj - self.palm_center_pos, dim=-1)
+        ft_d = torch.zeros_like(delta_z)
+        for i in range(self.fingertip_pos.shape[-2]):
+            ft_d += torch.norm(self.fingertip_pos[:, i, :] - obj, dim=-1)
+        ft_d = torch.clamp(ft_d, max=3.0)
+        flag = (ft_d <= 0.12 * self.num_fingers) | (palm_d <= 0.15)
+        lifted = delta_z > 0.1
+        if _PHASE == "pre":
+            return ~flag
+        if _PHASE == "grasp":
+            return flag & (~lifted)
+        if _PHASE == "all":
+            return torch.ones_like(lifted)
+        return lifted                      # "post" (기본)
 
     def _gs_apply_force(self):
         """외력을 물체에 건다. ★ simulate() 호출 직전마다 불려야 한다 — IsaacGym 의
@@ -73,12 +110,21 @@ def _wrap(Grasp):
             dirs = v / (v.norm(dim=-1, keepdim=True) + 1e-8)
         else:
             dirs = self._gs_dir
-        # ★ 성공 판정과 같은 조건에서만 발화 (post-lift only)
-        lifted = (self.object_pos[:, 2] - self.object_init_states[:, 2]) > 0.1
-        mag = self._gs_obj_mass * 9.81 * _EXTG * lifted.float()
+        mask = self._gs_phase_mask()
+        if _FSTEPS > 0:
+            # 시점에 처음 진입한 env-step 을 기록하고, 그로부터 _FSTEPS 스텝 동안만 발화한다.
+            if not hasattr(self, "_gs_t0"):
+                self._gs_t0 = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+            fresh = mask & (self._gs_t0 < 0)
+            self._gs_t0 = torch.where(fresh, self.progress_buf.long(), self._gs_t0)
+            self._gs_t0 = torch.where(self.progress_buf == 0,
+                                      torch.full_like(self._gs_t0, -1), self._gs_t0)
+            within = (self._gs_t0 >= 0) & ((self.progress_buf.long() - self._gs_t0) < _FSTEPS)
+            mask = mask & within
+        mag = self._gs_obj_mass * 9.81 * _EXTG * mask.float()
         self._gs_force.zero_()
         self._gs_force[self._gs_obj_rb] = dirs * mag.unsqueeze(-1)
-        self._gs_applied += int(lifted.sum().item() > 0)
+        self._gs_applied += int(mask.sum().item())   # 발화한 env-step 누적 (계측기 생존 확인용)
         self.gym.apply_rigid_body_force_tensors(
             self.sim, gymtorch.unwrap_tensor(self._gs_force), None, gymapi.ENV_SPACE)
 
@@ -112,7 +158,25 @@ def _wrap(Grasp):
                     self._gs_dir = torch.where(m, d, self._gs_dir)
         return out
 
+    def _gs_shift_object(self):
+        """계획 확정 직후(progress_buf==1) 물체를 수평 랜덤 방향으로 _SHIFT m 만큼 1회 이동."""
+        if _SHIFT == 0.0:
+            return
+        ids = (self.progress_buf == 1).nonzero(as_tuple=False).flatten()
+        if ids.numel() == 0:
+            return
+        ang = torch.rand(ids.numel(), device=self.device) * (2 * np.pi)
+        obj = self.object_indices[ids]
+        self.root_state_tensor[obj, 0] += torch.cos(ang) * _SHIFT
+        self.root_state_tensor[obj, 1] += torch.sin(ang) * _SHIFT
+        self.root_state_tensor[obj, 7:13] = 0.0
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim, gymtorch.unwrap_tensor(self.root_state_tensor),
+            gymtorch.unwrap_tensor(obj.to(torch.int32)), obj.numel())
+        self._gs_shifted += ids.numel()
+
     def step(self, actions):
+        self._gs_shift_object()
         if _EXTG == 0.0:
             return orig_step(self, actions)
         real = self.gym
@@ -135,13 +199,17 @@ def _wrap(Grasp):
                          successes=np.stack(rec),                       # [round, env]
                          object_id=np.arange(self.num_envs) % n_obj,    # env i -> 물체 i%n (grasp.py:399)
                          n_obj=n_obj, tau=int(self.max_episode_length),
-                         mass_scale=_MASS, ext_g=_EXTG,
+                         mass_scale=_MASS, ext_g=_EXTG, phase=_PHASE, force_steps=_FSTEPS, shift_m=_SHIFT,
+                         shifts=getattr(self, "_gs_shifted", 0),
+                         obj_mass_kg=float(self._gs_obj_mass.mean().item()),
                          force_applies=getattr(self, "_gs_applied", 0))
                 print("[gs] force applies so far: %d" % getattr(self, "_gs_applied", 0), flush=True)
         return out
 
     Grasp._create_envs = _create_envs
     Grasp._gs_apply_force = _gs_apply_force
+    Grasp._gs_phase_mask = _gs_phase_mask
+    Grasp._gs_shift_object = _gs_shift_object
     Grasp.pre_physics_step = pre_physics_step
     Grasp.step = step
     Grasp.compute_reward = compute_reward
