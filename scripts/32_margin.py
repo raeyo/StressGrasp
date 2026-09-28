@@ -16,9 +16,10 @@ def margins(path):
     al, di = d["alpha"], d["dir_idx"]
     alphas = sorted(set(float(a) for a in d["alphas"]))
     recs = []
+    rmin = min([int(sr[i]) for i in range(len(sr)) if not (tg[i] < 0).all()] or [0])
     for i, r in enumerate(sr):
-        if r == 0:
-            continue
+        if (tg[i] < 0).all():
+            continue          # ★ 실행되지 않은 라운드(빈 행). 코드 경로마다 개수가 달라 r==0 으로는 못 거른다
         main = su[i, :n] > 0.5
         ctrl = su[i, n:2 * n] > 0.5
         grip = tg[i] >= 0
@@ -32,7 +33,7 @@ def margins(path):
             for dd in range(6):
                 ok &= surv[(a, dd)]
             M = np.where(ok, a, M)
-        recs.append(dict(round=int(r), offset=max(0, int(r) - 1), main=main, ctrl=ctrl, grip=grip, M=M,
+        recs.append(dict(round=int(r), offset=int(r) - rmin, main=main, ctrl=ctrl, grip=grip, M=M,
                          surv=surv, t_grip=tg[i], fired=fired[i], grip_len=glen[i]))
     return d, alphas, recs
 

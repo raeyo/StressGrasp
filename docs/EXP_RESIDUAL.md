@@ -1,0 +1,77 @@
+# EXP — Residual RL 로 grip 마진 올리기 · 사전등록
+
+> ★ **판정 규칙은 측정 전에 고정한다.** 이 문서 §5 는 학습 결과를 보기 전에 작성됐다 (2026-09-29).
+> 수치를 본 뒤 임계값을 바꾸면 그 판정은 무효다. (graspstress PROTOCOL §5 규율 승계)
+> 근거가 되는 측정 = [`RESULTS_BRANCH.md`](RESULTS_BRANCH.md) · 장치 = [`EXP_BRANCH.md`](EXP_BRANCH.md)
+
+## 1. 문제 — 무엇을 이기는가
+
+[`RESULTS_BRANCH.md`](RESULTS_BRANCH.md) 가 잰 것: DemoGrasp 의 grip 구간 파지는
+**한 옥탄트만 버티는 반쪽 케이지**다 (손바닥 +x 0.96 vs −x 0.004 @606 mN).
+
+> **목표: DemoGrasp 레퍼런스 행동 위에 residual 을 얹어 이 마진을 올린다.
+> 단, lift 성공률을 잃지 않는다.**
+
+## 2. 개입 (이 실험이 바꾸는 것 — 오직 보상 하나)
+
+```
+a_t = compute_reference_actions()  +  Δ(o_t)         ← tasks/grasp.py:1313 이 주입점
+Δ  = [EE 위치 3, 손 관절 6],  ±1 cm / ±0.15(정규화)  로 클램프,  grip phase 에서만 적용
+```
+- 관측 = 특권 압축벡터 55-d (손 관절·손바닥 좌표계 물체 pose/속도·손끝 위치·접촉력·grip 경과).
+  teacher 가 특권 관측을 쓰는 것은 허용된다 (phasegrasp PROBLEM §11).
+- ★ **Δ 는 main env 의 관측으로 한 번 계산해 그룹 전체에 같은 값을 쓴다** — 그림자가 같은
+  컨트롤러로 굴러야 마진 측정의 의미(상태의 속성)가 유지된다.
+- 학습 = PPO (GAE λ=0.95, γ=0.99, clip 0.2, 4 epoch), grip 스텝만 학습에 쓴다.
+
+### 개입 축 = 보상 집계 방식 두 가지
+분기 지평 **H=5 env-step(1.67 s)** 마다 그림자의 물체 변위 `d_i` (i = 손바닥 ±xyz 6방향, α=1g=303 mN):
+```
+r_dir_i = τ / (τ + d_i),   τ = 5 mm          # 스케일 프리 (2~3 decade 에 기울기)
+MIN :  r = min_i r_dir_i     ← 최약축을 올린다 (ε 에 해당)
+SUM :  r = mean_i r_dir_i    ← 평균 저항을 올린다
++ 종단 보너스  W_succ · success  (W_succ = 1.0, 원 성공판정 그대로)
+```
+**MIN vs SUM 외의 모든 것은 동일하다.** 이것이 이 실험의 유일한 개입 축이다.
+
+대조군: **`zero`** — 같은 루프·같은 env·같은 그림자 측정을 돌리되 **Δ=0 으로 고정**.
+하네스 자체의 효과(그림자 env 추가, env 수 변화)를 분리한다.
+
+## 3. 왜 H=5 인가
+H=1 변위 라벨은 [`EXP_BRANCH.md`](EXP_BRANCH.md) §4 게이트에서 **유보**였다 (비율 0.217).
+H=5 에서 0.104 로 통과했다. **임계가 아니라 실험 조건을 바꾼 것이다.**
+
+## 4. 셀
+| | |
+|---|---|
+| 정책 | DemoGrasp teacher `inspire.pt` (레퍼런스) + 학습되는 residual |
+| 물체셋 | `ours_bench/ours_S.yaml` (33 물체) |
+| env | `n_obj 33 × replicas 4 = n_main 132`, G=8(main+control+6방향) → **num_envs 1056** |
+| 학습량 | 120 iteration (= 120 에피소드 배치, grip 스텝만 학습) |
+| 머신 | kimm-h200 **GPU 0·1 만** |
+
+## 5. ★ 판정 규칙 (측정 전 고정)
+
+학습이 끝나면 **baseline 과 완전히 같은 측정 프로토콜**로 잰다:
+replicate-once · palm 좌표계 · α 사다리 {0.125,0.25,0.5,1,2} · 6방향 · dose 1 env-step · 10 라운드.
+비교 대상 = `s2_palm_s42/s43` (baseline, M 평균 **0.435**, 전방향생존@606mN **0.004~0.012**,
+clean SR **0.755**). 잡음 바닥 = control 불일치 **4.9~7.0 %**, seed 반복폭 = M 평균 **0.010**.
+
+| 관문 | 기준 | 불통과 시 |
+|---|---|---|
+| **G1 비퇴화** (선결) | clean SR ≥ baseline − 0.05 | 마진이 올라도 **기각**. 보상 해킹으로 본다 |
+| **G2 마진** | M 평균이 baseline 대비 **+0.10 이상** (반복폭 0.010 의 10배) | 개입 무효 |
+| **G3 최약축** | 최약 방향 생존율이 baseline 대비 **+0.10 이상** | MIN 의 고유 기여 없음 |
+| **G4 변형 비교** | MIN 과 SUM 의 차가 seed 반복폭(0.010)의 3배(=0.03) 이상이어야 "다르다" 고 말한다 | 두 보상은 구별 불가로 보고 |
+
+**F-기준**: G1 을 통과하면서 G2 를 통과하는 변형이 **하나도 없으면** → residual 로는 이 마진을
+못 올린다. 구조(더 큰 행동 공간·더 이른 개입 시점)로 문제를 재정의해야 한다.
+
+추가로 반드시 병기한다 (성공률 아래의 행동 변화):
+- 방향별 생존율 6개 전부 (이방성이 완화됐는가, 아니면 강한 축만 더 강해졌는가)
+- Δ 의 크기 분포 (클램프에 붙어 있으면 행동 공간이 부족한 것)
+- 학습 곡선 `train.csv` (r_min·r_mean·succ)
+
+## 6. 기록
+- 원시 = `runs/residual/<tag>/` (레포 밖 취급) · 요약 = `results/residual_*.md` (커밋)
+- 평가 dump = `runs/branch/res_*/branch.npz` → `scripts/32_margin.py`·`34_cells.py`

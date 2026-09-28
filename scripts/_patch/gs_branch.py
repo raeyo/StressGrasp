@@ -39,6 +39,7 @@ _BCAST_AT = int(os.environ.get("GS_BR_BCAST_AT", "2") or 2)  # reset 후 몇 번
 _RESYNC = os.environ.get("GS_BR_RESYNC", "") not in ("", "0")  # grip 중 주기적 재동기화 (RL 보상용)
 _RE_EVERY = int(os.environ.get("GS_BR_RESYNC_EVERY", "1") or 1)  # 재동기화 주기(env-step). 분기 지평 H
 _FRAME = os.environ.get("GS_BR_FRAME", "world")               # world | palm — 외력 방향의 기준 좌표계
+_REPL = int(os.environ.get("GS_BR_REPLICAS", "1") or 1)       # 물체당 main env 복제 수 (RL 배치용)
 
 _DIRS = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
 
@@ -69,14 +70,17 @@ def _wrap(Grasp):
         out = orig_create_envs(self, *a, **kw)
         gym, sim, dev, N = self.gym, self.sim, self.device, self.num_envs
         n_obj = len(getattr(self, "object_pcls", None) or getattr(self, "object_fns", [1]))
-        G = N // n_obj
-        assert N % n_obj == 0 and G == len(SPEC), \
-            "num_envs 는 n_obj(%d) x G(%d) = %d 여야 한다 (지금 %d)" % (n_obj, len(SPEC), n_obj * len(SPEC), N)
+        n_main = n_obj * _REPL                      # main env 수 (물체당 _REPL 개 복제)
+        G = N // n_main
+        assert N % n_main == 0 and G == len(SPEC), \
+            "num_envs 는 n_obj(%d) x replicas(%d) x G(%d) = %d 여야 한다 (지금 %d)" % (
+                n_obj, _REPL, len(SPEC), n_main * len(SPEC), N)
 
         idx = torch.arange(N, device=dev)
-        self._br_n_obj, self._br_G = n_obj, G
-        self._br_src = idx % n_obj
-        self._br_group = idx // n_obj
+        self._br_n_obj, self._br_n_main, self._br_G = n_obj, n_main, G
+        self._br_src = idx % n_main                 # 각 env 의 main env 인덱스
+        self._br_obj = idx % n_obj                  # 물체 id (DemoGrasp 가 i % n_obj 로 배정)
+        self._br_group = idx // n_main
         self._br_sh = idx[self._br_group > 0]
         self._br_sh_src = self._br_src[self._br_sh]
 
@@ -94,15 +98,15 @@ def _wrap(Grasp):
         self._br_dirvec = torch.tensor([_DIRS[SPEC[g][1]] for g in gl], dtype=torch.float, device=dev)
         self._br_dir_idx = torch.tensor([SPEC[g][1] for g in gl], dtype=torch.long, device=dev)
 
-        self._br_round = -1
+        self._br_round = 0      # ★ 0-based. 에피소드가 실제로 돈 경우에만 증가한다
         self._br_bcast = 0
         self._br_k = 0
         self._br_fire = torch.zeros(N, dtype=torch.bool, device=dev)
-        self._br_t_grip = torch.full((n_obj,), -1, dtype=torch.long, device=dev)
-        self._br_fired = torch.zeros(n_obj, dtype=torch.bool, device=dev)   # 외력이 실제로 발사됐나
-        self._br_win, self._br_widx = 0, -1
+        self._br_t_grip = torch.full((n_main,), -1, dtype=torch.long, device=dev)
+        self._br_fired = torch.zeros(n_main, dtype=torch.bool, device=dev)  # 외력이 실제로 발사됐나
+        self._br_win, self._br_widx, self._br_active_win = 0, -1, False
         self._br_dirw = self._br_dirvec
-        self._br_griplen = torch.zeros(n_obj, dtype=torch.long, device=dev)  # grip 지속 스텝 수
+        self._br_griplen = torch.zeros(n_main, dtype=torch.long, device=dev)
         self._br_applied = 0
         self._br_rec = {"round": [], "step": [], "k": [], "win": [], "widx": [],
                         "disp": [], "dz": [], "objz": [], "dtheta": []}
@@ -113,15 +117,17 @@ def _wrap(Grasp):
         import atexit
         def _final():
             try:
-                if self._br_round >= 0 and (not self._br_succ_round or self._br_succ_round[-1] != self._br_round):
+                if getattr(self, "_br_ep_ran", False) and (
+                        not self._br_succ_round or self._br_succ_round[-1] != self._br_round):
                     _snap_round(self)       # ★ 마지막 라운드는 reset 이 안 오므로 여기서 봉인
             except Exception:
                 pass
             _save(self)
         atexit.register(_final)
-        print("[br] v2 | groups=%d (main + control + %d probe) | n_obj=%d envs=%d | alpha=%s"
-              " dose=%d offset=%s snap=%s | obj_mass_mean=%.4fkg"
-              % (G, G - 2, n_obj, N, _ALPHAS, _DOSE, _OFFSET, _SNAPS, self._br_mass.mean().item()), flush=True)
+        print("[br] v3 | groups=%d (main + control + %d probe) | n_obj=%d x repl=%d = n_main=%d | envs=%d"
+              " | alpha=%s dose=%d offset=%s H=%d frame=%s | obj_mass_mean=%.4fkg"
+              % (G, G - 2, n_obj, _REPL, n_main, N, _ALPHAS, _DOSE, _OFFSET, _RE_EVERY, _FRAME,
+                 self._br_mass.mean().item()), flush=True)
         return out
 
     # ---------------------------------------------------------- 복제 (리셋 직후 1회)
@@ -171,13 +177,18 @@ def _wrap(Grasp):
             allenv = _ON and (len(env_ids) == self.num_envs)
         except TypeError:
             allenv = False
-        if allenv and self._br_round >= 0:
-            _snap_round(self)
+        if allenv and getattr(self, "_br_ep_ran", False):
+            _snap_round(self)          # ★ 에피소드가 실제로 돈 경우에만 봉인 (빈 행 방지)
+        if allenv and getattr(self, "_br_ep_ran", False):
+            self._br_ep_done = True
+        self._br_ep_ran = False
         out = orig_reset(self, env_ids, *a, **kw)
         if not _ON:
             return out
+        if allenv and getattr(self, "_br_ep_done", False):
+            self._br_round += 1          # ★ 돈 에피소드 수만 센다 (코드 경로별 여분 reset 무시)
         if allenv:
-            self._br_round += 1
+            self._br_ep_done = False
             self._br_t_grip.fill_(-1)
             self._br_fired.zero_()
             self._br_griplen.zero_()
@@ -201,12 +212,13 @@ def _wrap(Grasp):
         out = orig_pre(self, actions)
         if not _ON:
             return out
-        n = self._br_n_obj
+        self._br_ep_ran = True
+        n = self._br_n_main
         grip = self._br_grip_mask()[:n]                       # main 그룹이 시점을 정한다
         t = self.progress_buf[:n].long()
         fresh = grip & (self._br_t_grip < 0)
         self._br_t_grip = torch.where(fresh, t, self._br_t_grip)
-        off = max(0, self._br_round - 1) if _OFFSET == "auto" else int(_OFFSET)
+        off = self._br_round if _OFFSET == "auto" else int(_OFFSET)
         age = t - self._br_t_grip
         on = (self._br_t_grip >= 0) & (age >= off) & (age < off + _DOSE) & grip
         self._br_fired |= on
@@ -217,8 +229,10 @@ def _wrap(Grasp):
                 self._br_broadcast()                # H 스텝마다 상태를 main 으로 되돌린다
                 self._br_widx += 1
             self._br_win = (self._br_win + 1) % max(1, _RE_EVERY)
+            self._br_active_win = True              # ★ 이 스텝이 윈도 안이다
         elif _RESYNC:
             self._br_win = 0
+            self._br_active_win = False
         f = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         f[self._br_sh] = on[self._br_sh_src]
         self._br_fire = f & (self._br_alpha > 0)
@@ -304,10 +318,12 @@ def _wrap(Grasp):
             t_grip=np.stack(self._br_tg).astype(np.int32) if self._br_tg else np.zeros((0, 1), np.int32),
             fired=np.stack(self._br_fired_log).astype(np.bool_) if self._br_fired_log else np.zeros((0, 1), np.bool_),
             grip_len=np.stack(self._br_griplen_log).astype(np.int32) if self._br_griplen_log else np.zeros((0, 1), np.int32),
-            group=self._br_group.cpu().numpy().astype(np.int32), obj_id=self._br_src.cpu().numpy().astype(np.int32),
+            group=self._br_group.cpu().numpy().astype(np.int32), obj_id=self._br_obj.cpu().numpy().astype(np.int32),
+            main_id=self._br_src.cpu().numpy().astype(np.int32),
             alpha=self._br_alpha.cpu().numpy().astype(np.float32), dir_idx=self._br_dir_idx.cpu().numpy().astype(np.int32),
             mass=self._br_mass.cpu().numpy().astype(np.float32),
-            n_obj=self._br_n_obj, G=self._br_G, dose=_DOSE, offset=str(_OFFSET),
+            n_obj=self._br_n_obj, n_main=self._br_n_main, replicas=_REPL,
+            G=self._br_G, dose=_DOSE, offset=str(_OFFSET),
             frame=_FRAME, resync=int(_RESYNC), resync_every=_RE_EVERY,
             snaps=np.array(_SNAPS, np.int32), alphas=np.array(_ALPHAS, np.float32), dirs=np.array(_DIRS, np.float32),
             force_applies=self._br_applied)

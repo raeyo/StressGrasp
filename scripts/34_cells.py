@@ -14,8 +14,8 @@ def cell(tag):
     S = {a: {dd: [] for dd in range(6)} for a in alphas}
     Ms, oks, mains = [], [], []
     for i, r in enumerate(sr):
-        if r == 0:
-            continue
+        if (tg[i] < 0).all():
+            continue          # ★ 실행되지 않은 라운드(빈 행)
         main = su[i, :n] > 0.5
         ok = main & (tg[i] >= 0) & fired[i]
         mains.append(main); oks.append(ok)
