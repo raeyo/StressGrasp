@@ -23,7 +23,10 @@
 import os
 
 _MODE = os.environ.get("GS_RESIDUAL", "")           # "" = 무동작
-_ON = _MODE in ("min", "sum", "zero", "plan_min", "plan_sum")
+_ON = _MODE in ("min", "sum", "zero", "plan_min", "plan_sum",
+                "bmin", "bsum", "plan_bmin", "plan_bsum")
+_BIN = "b" in _MODE.split("_")[-1][:1] or _MODE.split("_")[-1].startswith("b")   # 이진 보상 변형
+_THETA = float(os.environ.get("GS_RES_THETA", "20") or 20) / 1000.0   # 이진 임계 (mm -> m)
 _PLAN = _MODE.startswith("plan")          # t=0 계획(12-D edit)에 residual 을 얹는 변형
 _AGG = "min" if _MODE.endswith("min") else "mean"
 _SHAPE = os.environ.get("GS_RES_SHAPE", "1" if _MODE.startswith("plan") else "0") not in ("", "0")
@@ -38,6 +41,19 @@ _EVAL = os.environ.get("GS_RES_EVAL", "") not in ("", "0")
 _CKPT = os.environ.get("GS_RES_CKPT", "")
 _DPOS = float(os.environ.get("GS_RES_DPOS", "0.01") or 0.01)      # EE 위치 residual 한계 (m)
 _DHAND = float(os.environ.get("GS_RES_DHAND", "0.15") or 0.15)    # 손 관절 residual 한계 (정규화)
+
+
+def _reward(dd, torch):
+    """dd = [6, n] 변위(m) -> [n] 보상.
+    ★ 이진(원안): 움직였으면 0, 안 움직였으면 1.  기댓값이 곧 '버틸 확률' 이라
+      policy gradient 가 그것을 직접 추정한다. 연속형 τ/(τ+d) 는 최약축이 항상 파국이라
+      r≈상수(기울기 0)가 되어 학습이 서지 않았다 (RESULTS_RESIDUAL §2)."""
+    if _BIN:
+        per = (dd < _THETA).float()
+    else:
+        per = _TAU / (_TAU + dd)
+    r = per.min(0).values if _AGG == "min" else per.mean(0)
+    return r, per
 
 
 def _build():
@@ -137,8 +153,10 @@ def _run(ppo_self):
                     "norm_n": norm.n, "mode": _MODE, "din": din, "dact": dact},
                    os.path.join(out, "policy.pt"))
     opt = torch.optim.Adam(net.parameters(), lr=_LR)
-    print("[res] mode=%s obs=%d act=%d n_main=%d T=%d iters=%d tau=%.1fmm wsucc=%.2f out=%s"
-          % (_MODE, din, dact, n, T, _ITERS, _TAU * 1000, _WSUCC, out), flush=True)
+    print("[res] mode=%s%s obs=%d act=%d n_main=%d T=%d iters=%d %s wsucc=%.2f out=%s"
+          % (_MODE, " [BINARY]" if _BIN else " [cont]", din, dact, n, T, _ITERS,
+             ("theta=%.0fmm" % (_THETA * 1000)) if _BIN else ("tau=%.1fmm" % (_TAU * 1000)),
+             _WSUCC, out), flush=True)
 
     src = env._br_src
     G = env._br_G
@@ -148,6 +166,7 @@ def _run(ppo_self):
     if _EVAL:
         print("[res] EVAL — 원 eval 루프 10 라운드, residual 은 결정적(mean) 주입", flush=True)
         allenv = torch.arange(env.num_envs, device=dev)
+        _DSTAT = []
         for rd in range(10):
             cur = env.reset_idx(allenv)["obs"]
             with torch.no_grad():
@@ -168,12 +187,21 @@ def _run(ppo_self):
                 grip = env._br_grip_mask()[:n].float()
                 if _MODE == "zero":
                     a = a * 0
-                dpos = torch.tanh(a[:, :3]) * _DPOS * grip.unsqueeze(-1)
-                dhand = torch.tanh(a[:, 3:]) * _DHAND * grip.unsqueeze(-1)
+                th = torch.tanh(a)
+                if bool((grip > 0).any()):
+                    _DSTAT.append(th[grip > 0].detach())
+                dpos = th[:, :3] * _DPOS * grip.unsqueeze(-1)
+                dhand = th[:, 3:] * _DHAND * grip.unsqueeze(-1)
                 act = ref.clone()
                 act[:, 0:3] = act[:, 0:3] + dpos[src]
                 act[:, env.hand_dof_start_idx:] = act[:, env.hand_dof_start_idx:] + dhand[src]
                 env.step(act)
+            if _DSTAT:
+                dp = torch.cat(_DSTAT, 0)
+                print("[res]   |Δ| 포화도: pos %.3f (클램프 대비), hand %.3f | mean|tanh| = %s"
+                      % (dp[:, :3].abs().max(-1).values.mean(), dp[:, 3:].abs().max(-1).values.mean(),
+                         " ".join("%.2f" % v for v in dp.abs().mean(0))), flush=True)
+                _DSTAT.clear()
             print("[res] eval round %d  SR(main)=%.4f" % (rd, float((env.successes[:n] > 0.5).float().mean())), flush=True)
         env.reset_idx(allenv)          # 마지막 라운드 successes 를 gs_branch 가 봉인하게 한다
         raise SystemExit(0)
@@ -198,16 +226,18 @@ def _run(ppo_self):
             plan = teacher.clone()
             plan[:, :dplan] = torch.clamp(plan[:, :dplan] + dp[src], -1.0, 1.0)
             env.generate_reaching_plan_idx(allenv, actions=plan)
-            Rsum = torch.zeros(n, device=dev); nw = 0; dm = []
+            Rsum = torch.zeros(n, device=dev); nw = 0; dm = []; hold = []
             for t in range(T):
                 env.step(env.compute_reference_actions())
                 if getattr(env, "_br_active_win", False) and env._br_win == 0:
                     p = env.root_state_tensor[env.object_indices, 0:3]
                     dd = torch.stack([torch.norm(p[g * n:(g + 1) * n] - p[:n], dim=-1)
                                       for g in range(2, G)], 0)
-                    rd = _TAU / (_TAU + dd)
-                    r = rd.min(0).values if _AGG == "min" else rd.mean(0)
+                    r, per = _reward(dd, torch)
                     Rsum = Rsum + r * env._br_grip_mask()[:n].float()
+                    g_ = env._br_grip_mask()[:n]
+                    if bool(g_.any()):
+                        hold.append(per[:, g_].mean(1).detach().cpu().numpy())
                     nw += 1; dm.append(dd.max(0).values.detach().cpu().numpy())
             succ = (env.successes[:n] > 0.5).float()
             R = Rsum / max(nw, 1) + _WSUCC * succ
@@ -226,6 +256,9 @@ def _run(ppo_self):
                 nw, float(dall.max() * 1000), float(dall.mean() * 1000), float(dall.std() * 1000)))
             log.flush()
             if it % 5 == 0:
+                h = np.mean(np.stack(hold), 0) if hold else np.zeros(6)
+                print("[res]   hold/dir " + " ".join("%s=%.2f" % (d, v) for d, v in
+                      zip(["+x", "-x", "+y", "-y", "+z", "-z"], h)), flush=True)
                 print("[res] it=%3d R=%.3f margin=%.3f succ=%.3f win=%d dmean=%.1fmm"
                       % (it, float(R.mean()), float((Rsum / max(nw, 1)).mean()), float(succ.mean()),
                          nw, dall.mean() * 1000), flush=True)
@@ -266,13 +299,12 @@ def _run(ppo_self):
             if getattr(env, "_br_active_win", False) and env._br_win == 0:   # ★ 윈도 H 스텝 완료
                 p = env.root_state_tensor[env.object_indices, 0:3]
                 dd = torch.stack([torch.norm(p[g * n:(g + 1) * n] - p[:n], dim=-1) for g in range(2, G)], 0)
-                # ★ 스케일 프리 보상. exp(-d/τ) 는 파지가 깨지면(변위 m 단위) 즉시 0 으로 포화해
-                #   기울기가 사라진다. τ/(τ+d) 는 2~3 decade 에 걸쳐 단조 기울기를 준다.
-                rd = _TAU / (_TAU + dd)                                  # [6, n]
-                r = rd.min(0).values if _AGG == "min" else rd.mean(0)
+                r, per = _reward(dd, torch)
                 r = r * grip
-                stat["rmin"].append(rd.min(0).values[grip > 0].mean().item() if (grip > 0).any() else 0.0)
-                stat["rmean"].append(rd.mean(0)[grip > 0].mean().item() if (grip > 0).any() else 0.0)
+                stat["rmin"].append(per.min(0).values[grip > 0].mean().item() if (grip > 0).any() else 0.0)
+                stat["rmean"].append(per.mean(0)[grip > 0].mean().item() if (grip > 0).any() else 0.0)
+                if (grip > 0).any():
+                    stat.setdefault("hold", []).append(per[:, grip > 0].mean(1).detach().cpu().numpy())
                 stat["d"].append(dd.max(0).values[grip > 0].detach().cpu().numpy() if (grip > 0).any() else np.zeros(1))
                 stat["nwin"] += 1
             if t == T - 2:
@@ -291,6 +323,9 @@ def _run(ppo_self):
             float(dall.max() * 1000), float(dall.mean() * 1000), float(dall.std() * 1000)))
         log.flush()
         if it % 5 == 0:
+            h = np.mean(np.stack(stat["hold"]), 0) if stat.get("hold") else np.zeros(6)
+            print("[res]   hold/dir " + " ".join("%s=%.2f" % (d, v) for d, v in
+                  zip(["+x", "-x", "+y", "-y", "+z", "-z"], h)), flush=True)
             print("[res] it=%3d ret=%.3f r_min=%.3f r_mean=%.3f succ=%.3f win=%d dmax=%.2fmm"
                   % (it, ret_mean, np.mean(stat["rmin"]) if stat["rmin"] else 0,
                      np.mean(stat["rmean"]) if stat["rmean"] else 0, succ, stat["nwin"],
