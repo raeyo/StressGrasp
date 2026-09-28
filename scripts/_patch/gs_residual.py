@@ -121,6 +121,9 @@ def _run(ppo_self):
     env.reset_idx(torch.arange(env.num_envs, device=dev))
     din = priv_obs(env).shape[-1]
     dact = 3 + env.num_active_hand_dofs
+    if _CKPT and os.path.exists(_CKPT):
+        _ck0 = torch.load(_CKPT, map_location="cpu")
+        dact = int(_ck0.get("dact", dact))
     net = Net(din, dact).to(dev)
     norm = RunNorm(din, dev)
     if _CKPT:
@@ -149,8 +152,15 @@ def _run(ppo_self):
             cur = env.reset_idx(allenv)["obs"]
             with torch.no_grad():
                 plan = ppo_self.actor_critic(cur, env.get_state(), inference=True)
+                if _PLAN:
+                    dp = torch.tanh(net.pi(norm(priv_obs(env), update=False))) * _DPLAN
+                    k = dp.shape[-1]
+                    plan[:, :k] = torch.clamp(plan[:, :k] + dp[src], -1.0, 1.0)
             env.generate_reaching_plan_idx(allenv, actions=plan)
             for t in range(T):
+                if _PLAN:                      # 계획만 바꾸고 스텝 행동은 원 레퍼런스 그대로
+                    env.step(env.compute_reference_actions())
+                    continue
                 ref = env.compute_reference_actions()
                 on = norm(priv_obs(env), update=False)
                 with torch.no_grad():
