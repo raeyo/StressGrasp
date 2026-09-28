@@ -32,6 +32,22 @@ for log in sorted(ROOT.glob("runs/grid/*/eval.log")):
                       seed=int(d["seed"]), sr=sum(srs) / len(srs),
                       std=statistics.pstdev(srs), mode="teacher"))
 
+# RobustDexGrasp: "==== RobustDexGrasp in DemoGrasp env: mean SR = x +/- y"
+RDX = re.compile(r"^rdx__(?P<hand>[^_]+(?:_[^_]+)*?)__(?P<obj>.+?)__m(?P<m>[0-9.]+)__g(?P<g>[0-9.]+)__"
+                 r"(?P<ph>pre|grasp|post|all)d(?P<d>\d+)__s(?P<s>[0-9.]+)__seed(?P<seed>\d+)$")
+for log in sorted(ROOT.glob("runs/rdx/*/eval.log")):
+    m = RDX.match(log.parent.name)
+    if not m:
+        continue
+    hit = re.findall(r"mean SR = ([0-9.]+) \+/- ([0-9.]+)", log.read_text(errors="ignore"))
+    if not hit:
+        continue
+    d = m.groupdict()
+    cells.append(dict(policy="RobustDexGrasp", hand=d["hand"], objset=d["obj"], mass=float(d["m"]),
+                      ext_g=float(d["g"]), phase=d["ph"], dose=int(d["d"]), shift_cm=float(d["s"]),
+                      seed=int(d["seed"]), sr=float(hit[-1][0]), std=float(hit[-1][1]),
+                      mode="closed-loop 5Hz"))
+
 # student: "=== OPEN-LOOP  SR = x +/- y" / "=== CLOSED-LOOP H=8 SR = ..."
 for log in sorted(ROOT.glob("runs/student/*/eval.log")):
     name = log.parent.name

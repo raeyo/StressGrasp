@@ -43,6 +43,7 @@ def _wrap(Grasp):
     orig_create_envs = Grasp._create_envs
     orig_pre = Grasp.pre_physics_step
     orig_step = Grasp.step
+    orig_reset = Grasp.reset_idx
     orig_reward = Grasp.compute_reward
 
     def _create_envs(self, *a, **kw):
@@ -65,6 +66,11 @@ def _wrap(Grasp):
         self._gs_force = torch.zeros((self._gs_n_rb, 3), dtype=torch.float, device=self.device)
         self._gs_dir = None
         self._gs_applied = 0
+        self._gs_shift_pending = False
+        if _EXTG != 0.0 or _SHIFT != 0.0:
+            # RDX 포팅본은 Grasp.step 을 안 거치고 gym.simulate 를 직접 부른다.
+            # 그래서 프록시를 step 래퍼가 아니라 여기서 영구 장착한다.
+            self.gym = _GymProxy(self.gym, self)
         self._gs_shifted = 0
         print("[gs] mass x%.3g (obj mass mean %.4f kg) | ext_g %.3g (%s, phase=%s) | envs %d"
               % (_MASS, self._gs_obj_mass.mean().item(), _EXTG, _MODE,
@@ -141,6 +147,7 @@ def _wrap(Grasp):
 
         def simulate(self, *a, **kw):
             t = object.__getattribute__(self, "_task")
+            t._gs_shift_object()
             t._gs_apply_force()
             return object.__getattribute__(self, "_g").simulate(*a, **kw)
 
@@ -159,12 +166,17 @@ def _wrap(Grasp):
         return out
 
     def _gs_shift_object(self):
-        """계획 확정 직후(progress_buf==1) 물체를 수평 랜덤 방향으로 _SHIFT m 만큼 1회 이동."""
-        if _SHIFT == 0.0:
+        """정책이 관측·계획을 확정한 뒤 물체를 수평 랜덤 방향으로 _SHIFT m 만큼 1회 이동.
+
+        ★ 발화 시점 = **reset 이후 첫 gym.simulate 직전**. progress_buf 를 쓰지 않는 이유:
+          RobustDexGrasp 포팅본은 pre-grasp 를 set_gc_pose 로 직접 써서 env.step() 을
+          한 번도 부르지 않는다 -> progress_buf 가 0 에 머물러 훅이 영원히 발화하지 않았다(실측).
+          simulate 는 두 경로 모두 반드시 거친다.
+        """
+        if _SHIFT == 0.0 or not getattr(self, "_gs_shift_pending", False):
             return
-        ids = (self.progress_buf == 1).nonzero(as_tuple=False).flatten()
-        if ids.numel() == 0:
-            return
+        self._gs_shift_pending = False
+        ids = torch.arange(self.num_envs, device=self.device)
         ang = torch.rand(ids.numel(), device=self.device) * (2 * np.pi)
         obj = self.object_indices[ids]
         self.root_state_tensor[obj, 0] += torch.cos(ang) * _SHIFT
@@ -175,16 +187,15 @@ def _wrap(Grasp):
             gymtorch.unwrap_tensor(obj.to(torch.int32)), obj.numel())
         self._gs_shifted += ids.numel()
 
+    def reset_idx(self, *a, **kw):
+        out = orig_reset(self, *a, **kw)
+        self._gs_shift_pending = True          # 다음 simulate 직전에 1회 발화
+        return out
+
     def step(self, actions):
-        self._gs_shift_object()
-        if _EXTG == 0.0:
-            return orig_step(self, actions)
-        real = self.gym
-        self.gym = _GymProxy(real, self)          # simulate 20회 전부에 힘이 걸린다
-        try:
-            return orig_step(self, actions)
-        finally:
-            self.gym = real
+        # 프록시는 _create_envs 에서 이미 영구 장착됐다 (RDX 가 Grasp.step 을 안 거치므로).
+        # 여기서 다시 감싸면 substep 당 2회 발화한다 -> 감싸지 않는다.
+        return orig_step(self, actions)
 
     def compute_reward(self):
         out = orig_reward(self)
@@ -211,10 +222,40 @@ def _wrap(Grasp):
     Grasp._gs_phase_mask = _gs_phase_mask
     Grasp._gs_shift_object = _gs_shift_object
     Grasp.pre_physics_step = pre_physics_step
+    Grasp.reset_idx = reset_idx
     Grasp.step = step
     Grasp.compute_reward = compute_reward
     Grasp._gs_patched = True
     print("[gs] Grasp patched", flush=True)
+
+
+def _wrap_rdx(mod):
+    """RobustDexGrasp 포팅본은 run_eval 안에서 apply_orig_masses() 로 질량을 다시 덮어쓴다.
+    우리 스케일이 지워지므로, 그 함수를 감싸 **뒤에** 다시 적용한다."""
+    if _MASS == 1.0:
+        return
+    fn = getattr(mod, "apply_orig_masses", None)
+    if fn is None or getattr(fn, "_gs_wrapped", False):
+        return
+    from isaacgym import gymapi
+
+    def apply_orig_masses(env, *a, **kw):
+        out = fn(env, *a, **kw)
+        gym, tot = env.gym, 0.0
+        for env_ptr in env.envs:
+            h = gym.find_actor_handle(env_ptr, "object")
+            props = gym.get_actor_rigid_body_properties(env_ptr, h)
+            for pr in props:
+                pr.mass = pr.mass * _MASS
+            gym.set_actor_rigid_body_properties(env_ptr, h, props, recomputeInertia=True)
+            tot += sum(pr.mass for pr in gym.get_actor_rigid_body_properties(env_ptr, h))
+        print("[gs] re-applied mass x%.3g AFTER apply_orig_masses -> mean %.4f kg"
+              % (_MASS, tot / len(env.envs)), flush=True)
+        return out
+
+    apply_orig_masses._gs_wrapped = True
+    mod.apply_orig_masses = apply_orig_masses
+    print("[gs] eval_robustdex.apply_orig_masses wrapped", flush=True)
 
 
 def install():
@@ -223,17 +264,18 @@ def install():
         return
     import importlib.abc, importlib.machinery, sys
 
-    TARGET = "tasks.grasp"
+    TARGETS = ("tasks.grasp", "eval_robustdex")
 
     class _Hook(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         def find_spec(self, name, path=None, target=None):
-            if name != TARGET:
+            if name not in TARGETS:
                 return None
             sys.meta_path.remove(self)
             try:
                 spec = importlib.machinery.PathFinder.find_spec(name, path)
             finally:
                 sys.meta_path.insert(0, self)
+            # eval_robustdex 는 여러 번 import 될 수 있으니 훅을 유지한다
             if spec is None:
                 return None
             inner = spec.loader
@@ -247,6 +289,8 @@ def install():
                     G = getattr(mod, "Grasp", None)
                     if G is not None:
                         _wrap(G)
+                    if getattr(mod, "__name__", "") == "eval_robustdex":
+                        _wrap_rdx(mod)
 
             spec.loader = _L()
             return spec
