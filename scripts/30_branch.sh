@@ -22,7 +22,7 @@ GS_BRANCH=1 GS_BR_ALPHA="$ALPHAS" GS_BR_PHASE="$PHASE" GS_BR_DUMP="$OUT/branch.n
   task.env.asset.multiObjectList="$OBJSET" \
   task.env.randomizeTrackingReference=True task.env.randomizeGraspPose=True \
   task.env.trackingReferenceFile="${GS_REF:-tasks/grasp_ref_inspire.pkl}" \
-  task.env.trackingReferenceLiftTimestep=13 \
+  task.env.trackingReferenceLiftTimestep="${GS_LIFT:-13}" ${GS_HAND:+hand=$GS_HAND} \
   task.env.episodeLength=50 task.env.enablePointCloud=True train.params.is_vision=True \
   checkpoint="$CKPT" > "$OUT/eval.log" 2>&1
 RC=$?

@@ -102,6 +102,19 @@ replicate-once 모드**를 추가로 만들었고, 본 결과(§3)는 그 모드
 (control 그룹이 main 의 성공을 재현하는가)를 썼다 — 이것은 **수치를 보기 전에** 정의했다.
 per-step 모드는 §4 의 원 게이트를 그대로 적용해 **유보** 판정을 받았고, 그대로 기록한다.
 
+## 5-2. 추가 실험 (2026-09-29)
+
+사전등록 §3 셀에 더해 다음을 돌렸다. 모두 **판정 규칙은 §4·§5 를 그대로 적용**했다.
+
+| 추가 | 왜 | 결과 위치 |
+|---|---|---|
+| **외력 좌표계 palm** (`GS_BR_FRAME=palm`) | world 축은 손 자세와 무관해 약한 축을 비껴갈 수 있다 | RESULTS §3-1·3-2 |
+| **분기 지평 H** (`GS_BR_RESYNC_EVERY`) | H=1 변위 라벨이 §4 게이트에서 유보 → 지평만 늘려 재측정 | RESULTS §2-1 |
+| **embodiment 3종** (Inspire/Shadow/Allegro) | lift SR 과 마진의 순위가 같은가 (graspstress PROBLEM RQ2) | RESULTS §3-3 |
+| **물체 크기** (`ours_L`) | 이방성이 물체 크기에 의존하는가 | RESULTS §3-3 |
+
+★ 임계값은 사후 변경하지 않았다. H 연장은 **임계가 아니라 실험 조건**을 바꾼 것이다.
+
 ## 6. 기록
 - 원시 = `runs/branch/<tag>/branch.npz` (레포 밖 취급)
 - 요약 = `results/branch_*.md` (커밋)

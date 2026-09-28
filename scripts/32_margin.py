@@ -11,6 +11,8 @@ def margins(path):
     d = np.load(path, allow_pickle=True)
     n, G = int(d["n_obj"]), int(d["G"])
     su, sr, tg = d["success"], d["success_round"], d["t_grip"]
+    fired = d["fired"] if "fired" in d.files else np.ones_like(tg, bool)
+    glen = d["grip_len"] if "grip_len" in d.files else np.zeros_like(tg)
     al, di = d["alpha"], d["dir_idx"]
     alphas = sorted(set(float(a) for a in d["alphas"]))
     recs = []
@@ -30,8 +32,8 @@ def margins(path):
             for dd in range(6):
                 ok &= surv[(a, dd)]
             M = np.where(ok, a, M)
-        recs.append(dict(round=int(r), offset=int(r), main=main, ctrl=ctrl, grip=grip, M=M,
-                         surv=surv, t_grip=tg[i]))
+        recs.append(dict(round=int(r), offset=max(0, int(r) - 1), main=main, ctrl=ctrl, grip=grip, M=M,
+                         surv=surv, t_grip=tg[i], fired=fired[i], grip_len=glen[i]))
     return d, alphas, recs
 
 
@@ -42,10 +44,17 @@ def report(path, alphas, recs, label):
     grip = np.concatenate([r["grip"] for r in recs])
     M = np.concatenate([r["M"] for r in recs])
     off = np.concatenate([np.full(n, r["offset"]) for r in recs])
+    fired = np.concatenate([r["fired"] for r in recs])
+    glen = np.concatenate([r["grip_len"] for r in recs])
     mass = 0.0309
-    ok = main & grip                                # lift 성공 + grip 진입한 상태만
+    # ★ 외력이 실제로 걸린 상태만 센다. 안 걸린 것을 "생존"으로 세면 마진이 부풀려진다 (버그 B1).
+    ok = main & grip & fired
     print(f"\n########## {label} ##########")
-    print(f"  상태 수: 전체 {len(main)},  main 성공&grip {ok.sum()}")
+    print(f"  상태 수: 전체 {len(main)} · grip 진입 {int(grip.sum())} · 외력 실발사 {int((grip & fired).sum())}"
+          f" · **main 성공&grip&발사 {int(ok.sum())}**")
+    lost = int((grip & main & ~fired).sum())
+    print(f"  제외: grip 진입 + main 성공인데 외력 미발사 {lost} 개 (창이 열리기 전 lift 완료)"
+          f"  |  grip 지속 median {np.median(glen[grip]):.0f} step")
     print(f"  S0 잡음바닥: control 불일치 {np.mean(main != ctrl):.2%}  (main SR {main.mean():.4f} / control SR {ctrl.mean():.4f})")
 
     print(f"\n  [Q1] lift 성공한 grasp 들 사이의 마진 M 분포  (M = 6방향 전부 버티는 최대 α, 무게배수)")
@@ -59,8 +68,9 @@ def report(path, alphas, recs, label):
     print(f"      판정: IQR({qs[3]-qs[1]:.3f}) vs 사다리 1칸(×{step:g}) → "
           + ("**퍼져 있다** = lift SR 이 안정성 분산을 숨긴다" if qs[3] > qs[1] else "퍼지지 않음 → F(학습 여지 없음)"))
 
-    print(f"\n  [Q2] M 이 main 의 최종 성공을 예측하는가 (grip 진입한 상태 전부, n={int(grip.sum())})")
-    y = main[grip].astype(float); x = M[grip]
+    gf = grip & fired
+    print(f"\n  [Q2] M 이 main 의 최종 성공을 예측하는가 (grip&발사 상태 전부, n={int(gf.sum())})")
+    y = main[gf].astype(float); x = M[gf]
     pos, neg = x[y > 0.5], x[y < 0.5]
     if len(pos) and len(neg):
         auc = (np.greater.outer(pos, neg).mean() + 0.5 * np.equal.outer(pos, neg).mean())
