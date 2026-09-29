@@ -4,7 +4,7 @@
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"; gs_check >/dev/null
 
-MODE="${1:?min|sum|zero}"; TAG="${2:?}"; ITERS="${3:-150}"
+MODE="${1:?min|sum|zero|bmin|bsum|plan_*|sweep|oracle}"; TAG="${2:?}"; ITERS="${3:-150}"
 OBJSET="${GS_OBJSET:-ours_bench/ours_S.yaml}"
 REPL="${GS_REPL:-4}"; ALPHA="${GS_ALPHA:-1}"; H="${GS_H:-5}"; SEED="${GS_SEED:-42}"
 NOBJ="$(grep -c '^- ' "$DG_ROOT/assets/$OBJSET")"
@@ -26,6 +26,7 @@ GS_RESIDUAL="$MODE" GS_RES_ITERS="$ITERS" GS_RES_TAG="$TAG" GS_RES_OUT="$OUT" \
   task.env.randomizeTrackingReference=True task.env.randomizeGraspPose=True \
   task.env.trackingReferenceFile="${GS_REF:-tasks/grasp_ref_inspire.pkl}" \
   task.env.trackingReferenceLiftTimestep="${GS_LIFT:-13}" \
+  task.env.resetDofPosRandomInterval="${GS_DOFNOISE:-0.2}" \
   task.env.episodeLength=50 task.env.enablePointCloud=True train.params.is_vision=True \
   checkpoint="${GS_CKPT:-ckpt/inspire.pt}" > "$OUT/train.log" 2>&1
 RC=$?

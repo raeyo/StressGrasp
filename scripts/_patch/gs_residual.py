@@ -24,7 +24,7 @@ import os
 
 _MODE = os.environ.get("GS_RESIDUAL", "")           # "" = 무동작
 _ON = _MODE in ("min", "sum", "zero", "plan_min", "plan_sum",
-                "bmin", "bsum", "plan_bmin", "plan_bsum", "sweep")
+                "bmin", "bsum", "plan_bmin", "plan_bsum", "sweep", "oracle")
 _SWEEP = os.environ.get("GS_RES_SWEEP", "hand")     # hand | posz | posx — 무엇을 쓸어볼지
 _ALLPH = os.environ.get("GS_RES_ALLPHASE", "") not in ("", "0")   # grip 게이팅 해제(접근부터 적용)
 _BIN = (_MODE.split("_")[-1].startswith("b")
@@ -166,6 +166,78 @@ def _run(ppo_self):
     log = open(os.path.join(out, "train.csv"), "a")
     log.write("iter,ret,margin_min,margin_mean,succ,nwin,dmax_mm,dmean_mm,dstd\n"); log.flush()
 
+    if _MODE == "oracle":
+        # ★ 물체별 오라클 상한 — 학습 없이 CEM 으로 "이 장면에서 최선의 12-D edit" 을 찾는다.
+        #   목적 = 개입 게이트를 **도달 가능한 범위** 위에서 정하기 위함 (RESULTS_RESIDUAL §9).
+        #   물체 초기자세를 고정해 같은 장면에서 후보만 비교한다 (평가 잡음 제거).
+        n_obj = env._br_n_obj
+        R = n // n_obj                                   # 물체당 후보 수
+        dp = 6 + env.num_active_hand_dofs
+        allenv = torch.arange(env.num_envs, device=dev)
+        gens = int(os.environ.get("GS_RES_GENS", "20") or 20)
+        elite = max(2, R // 4)
+        cur = env.reset_idx(allenv)["obs"]
+        pose0 = env.root_state_tensor[env.object_indices, 0:7].clone()   # 안착된 자세를 고정
+        pose0 = pose0[:n_obj].repeat(int(np.ceil(env.num_envs / n_obj)), 1)[:env.num_envs]
+        with torch.no_grad():
+            teach = ppo_self.actor_critic(cur, env.get_state(), inference=True)[:, :dp].clone()
+        mu = teach[:n_obj].clone()                       # 물체별 평균 = teacher 의 edit 에서 출발
+        sd = torch.full_like(mu, float(os.environ.get("GS_RES_SIG", "0.35") or 0.35))
+        best = torch.full((n_obj,), -1.0, device=dev); best_a = mu.clone()
+        base = None
+        print("[res] ORACLE  n_obj=%d R=%d gens=%d dim=%d sigma0=%.2f  (물체자세 고정, CEM)"
+              % (n_obj, R, gens, dp, float(sd[0, 0])), flush=True)
+        for g in range(gens):
+            cand = (mu.repeat(R, 1) + sd.repeat(R, 1) * torch.randn(n, dp, device=dev)).clamp(-1, 1)
+            if g == 0:
+                cand[:n_obj] = teach[:n_obj]             # 후보 0 = teacher (기준선을 항상 포함)
+            env.reset_idx(allenv, object_init_pose=pose0.cpu().numpy())
+            plan = torch.zeros(env.num_envs, dp, device=dev)
+            plan[:n] = cand
+            env.generate_reaching_plan_idx(allenv, actions=plan[env._br_src])
+            hold_acc = torch.zeros(n, device=dev); nw = torch.zeros(n, device=dev)
+            for t in range(T):
+                env.step(env.compute_reference_actions())
+                if getattr(env, "_br_active_win", False) and env._br_win == 0:
+                    p_ = env.root_state_tensor[env.object_indices, 0:3]
+                    dd = torch.stack([torch.norm(p_[gg * n:(gg + 1) * n] - p_[:n], dim=-1)
+                                      for gg in range(2, G)], 0)
+                    _, per = _reward(dd, torch)
+                    gm = env._br_grip_mask()[:n].float()
+                    hold_acc += per.mean(0) * gm; nw += gm
+            succ = (env.successes[:n] > 0.5).float()
+            score = torch.where(nw > 0, hold_acc / nw.clamp(min=1), torch.zeros_like(hold_acc))
+            score = torch.where(succ > 0.5, score, torch.full_like(score, -1.0))   # lift 실패 = 탈락
+            S = score.view(R, n_obj); C = cand.view(R, n_obj, dp)
+            if g == 0:
+                base = S[0].clone()
+            top = S.topk(min(elite, R), dim=0).indices                 # [elite, n_obj]
+            sel = torch.gather(C, 0, top.unsqueeze(-1).expand(-1, -1, dp))
+            mu = sel.mean(0); sd = sel.std(0).clamp(min=0.05)
+            b, bi = S.max(0)
+            upd = b > best
+            best = torch.where(upd, b, best)
+            best_a[upd] = torch.gather(C, 0, bi.view(1, n_obj, 1).expand(1, -1, dp))[0][upd]
+            ok = best > -0.5
+            print("[res] gen %2d  best 평균=%.4f (유효 %d/%d)  세대최고 평균=%.4f  σ 평균=%.3f"
+                  % (g, float(best[ok].mean()) if ok.any() else -1, int(ok.sum()), n_obj,
+                     float(b[b > -0.5].mean()) if (b > -0.5).any() else -1, float(sd.mean())), flush=True)
+        okb = base > -0.5
+        print("\n[res] === 오라클 상한 ===", flush=True)
+        print("[res] teacher(기준선) hold 평균 = %.4f  (lift 성공 물체 %d/%d)"
+              % (float(base[okb].mean()), int(okb.sum()), n_obj), flush=True)
+        ok = best > -0.5
+        print("[res] 오라클 최선   hold 평균 = %.4f  (유효 %d/%d)" % (float(best[ok].mean()), int(ok.sum()), n_obj), flush=True)
+        both = okb & ok
+        print("[res] 같은 물체 짝지어: teacher %.4f -> 오라클 %.4f   (Δ=%+.4f, %.2f배)"
+              % (float(base[both].mean()), float(best[both].mean()),
+                 float((best - base)[both].mean()), float(best[both].mean() / max(float(base[both].mean()), 1e-9))), flush=True)
+        np.savez(os.path.join(out, "oracle.npz"), best=best.cpu().numpy(), base=base.cpu().numpy(),
+                 best_action=best_a.cpu().numpy(), teacher=teach[:n_obj].cpu().numpy(),
+                 pose0=pose0[:n_obj].cpu().numpy())
+        print("[res] saved", os.path.join(out, "oracle.npz"), flush=True)
+        raise SystemExit(0)
+
     if _MODE == "sweep":
         # ★ 감사: 고정된 큰 Δ 를 replica 별로 다르게 넣고 마진이 **움직이기는 하는가** 를 본다.
         #    안 움직이면 학습 문제가 아니라 하네스/설계 문제다.
@@ -226,7 +298,7 @@ def _run(ppo_self):
     if _EVAL:
         print("[res] EVAL — 원 eval 루프 10 라운드, residual 은 결정적(mean) 주입", flush=True)
         allenv = torch.arange(env.num_envs, device=dev)
-        _DSTAT = []
+        _DSTAT = []; _HOLD = []
         for rd in range(10):
             cur = env.reset_idx(allenv)["obs"]
             with torch.no_grad():
@@ -239,6 +311,14 @@ def _run(ppo_self):
             for t in range(T):
                 if _PLAN:                      # 계획만 바꾸고 스텝 행동은 원 레퍼런스 그대로
                     env.step(env.compute_reference_actions())
+                    if getattr(env, "_br_active_win", False) and env._br_win == 0:
+                        p_ = env.root_state_tensor[env.object_indices, 0:3]
+                        dd = torch.stack([torch.norm(p_[g2 * n:(g2 + 1) * n] - p_[:n], dim=-1)
+                                          for g2 in range(2, G)], 0)
+                        _, per = _reward(dd, torch)
+                        gm = env._br_grip_mask()[:n]
+                        if bool(gm.any()):
+                            _HOLD.append(per[:, gm].mean(1).detach().cpu().numpy())
                     continue
                 ref = env.compute_reference_actions()
                 on = norm(priv_obs(env), update=False)
@@ -263,6 +343,11 @@ def _run(ppo_self):
                          " ".join("%.2f" % v for v in dp.abs().mean(0))), flush=True)
                 _DSTAT.clear()
             print("[res] eval round %d  SR(main)=%.4f" % (rd, float((env.successes[:n] > 0.5).float().mean())), flush=True)
+        if _HOLD:
+            h = np.mean(np.stack(_HOLD), 0)
+            print("[res] === hold/dir %s | 평균 %.4f | all6 %.4f ==="
+                  % (" ".join("%s=%.3f" % (d, v) for d, v in
+                     zip(["+x", "-x", "+y", "-y", "+z", "-z"], h)), h.mean(), np.prod(h)), flush=True)
         env.reset_idx(allenv)          # 마지막 라운드 successes 를 gs_branch 가 봉인하게 한다
         raise SystemExit(0)
 
