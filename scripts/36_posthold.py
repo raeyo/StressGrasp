@@ -169,7 +169,7 @@ def pool(states):
         ctrl_y_hold=np.concatenate([s["ctrl_y_hold"] for s in states]),
         ctrl_y_pose=np.concatenate([s["ctrl_y_pose"] for s in states]),
         ctrl_ep_end=np.concatenate([s["ctrl_ep_end"] for s in states]),
-        **{k: np.concatenate([s[k] for s in states])
+        **{k: np.concatenate([s[k] for s in states], axis=1)   # (6방향, 상태) — 상태 축으로 잇는다
            for k in ("p_fin", "p_y_hold", "p_y_pose", "p_ep_max", "p_eR_max")})
 
 
