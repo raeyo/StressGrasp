@@ -10,6 +10,11 @@
 > 부족이었다. 상세 = **§9**. 보상 형태(이진/연속)는 애초에 구속 조건이 아니었고, 그래서
 > 이진으로 고쳐도 아무것도 바뀌지 않은 것이다.
 
+> 🔴🔴🔴 **3차 정정 (2026-09-30)**: 아래 전 변형이 쓴 특권 55-d 의 **접촉력 18차원은 상수 0**
+> 이었다 (`contact_collection: 0` = CC_NEVER). 즉 6개 residual 변형은 **접촉 정보를 하나도 보지 못한
+> 채** 학습됐다. §5 의 "보상이 관측의 함수가 아니다"는 진단은 더 강하게 성립하며,
+> **촉각 기반 개입은 이 프로젝트에서 미측정**이다. 상세 = [`RESULTS_CRITIC.md`](RESULTS_CRITIC.md) §0-1.
+>
 > 사전등록 = [`EXP_RESIDUAL.md`](EXP_RESIDUAL.md) (판정 규칙은 수치 보기 전에 고정).
 > 측정 장치·baseline = [`RESULTS_BRANCH.md`](RESULTS_BRANCH.md). 원시 = `runs/residual/`·`runs/branch/res_*`.
 > kimm-h200 GPU 0·1. 1 env step = 0.3333 s.

@@ -30,6 +30,7 @@ GS_RES_TAG="$TAG" GS_RES_OUT="$OUT" \
   task.env.trackingReferenceLiftTimestep="${GS_LIFT:-13}" \
   task.env.resetDofPosRandomInterval="${GS_DOFNOISE:-0.2}" \
   task.env.episodeLength=50 task.env.enablePointCloud=True train.params.is_vision=True \
+  task.sim.physx.contact_collection="${GS_CC:-0}" \
   checkpoint="${GS_CKPT:-ckpt/inspire.pt}" > "$OUT/ds.log" 2>&1
 echo "[ds] rc=$?  log=$OUT/ds.log"
 grep -a "^\[res\]\|^\[br\]" "$OUT/ds.log" | head -3
