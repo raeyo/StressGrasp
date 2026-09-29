@@ -1,5 +1,7 @@
 # 대용량·기계 산출물은 레포 밖 (우산 README §2)
 runs/
+# DG 작업 사본 — env/spec.sh 가 조립한다 (external 원본 + 패치, SETUP.md §1)
+third_party/DemoGrasp/
 *.log
 *.pt
 __pycache__/

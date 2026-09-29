@@ -1,0 +1,589 @@
+diff --git a/run_rl_grasp.py b/run_rl_grasp.py
+index a9add98..72b3491 100644
+--- a/run_rl_grasp.py
++++ b/run_rl_grasp.py
+@@ -105,7 +105,7 @@ def collect_real_dataset(cfg, env):
+ 
+     from data.dataset_utils import LerobotDatasetWriter
+     dataset_writer = LerobotDatasetWriter(
+-        output_path=f"{env.hand_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M')}",
++        output_path=f"{env.hand_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M')}{'_dr' if getattr(env, 'apply_render_randomization', False) else ''}_g{cfg.graphics_device_id}",
+         camera_ids=env.camera_ids,
+         data_type=env.render_data_type,
+         image_shape=(*env.render_cfg["resize"], 3),
+@@ -152,6 +152,13 @@ def main(cfg: DictConfig) -> None:
+     # set numpy formatting for printing only
+     set_np_formatting()
+ 
++    # pin default CUDA device so grasp.py's to_torch override lands tensors on sim_device,
++    # enabling per-GPU no-mask parallel collection. See demograsp_repro/COLLECTION.md §6.
++    import torch as _torch
++    _sd = str(cfg.sim_device)
++    if _sd.startswith("cuda:") and _torch.cuda.is_available():
++        _torch.cuda.set_device(int(_sd.split(":")[1]))
++
+     # global rank of the GPU
+     global_rank = int(os.getenv("RANK", "0"))
+ 
+@@ -197,7 +204,63 @@ def main(cfg: DictConfig) -> None:
+         
+         elif cfg["debug"] == "collect_real_dataset":
+             collect_real_dataset(cfg, env)
+-        
++
++        elif cfg["debug"] == "eval_report":
++            from eval_report import eval_report
++            eval_report(cfg, env)
++
++        elif cfg["debug"] == "eval_robustdex":
++            import sys as _sys
++            _sp = os.path.join(os.environ["DG_REPRO"], "robustdex")  # DG_REPRO = env.sh / _common.sh
++            if _sp not in _sys.path:
++                _sys.path.insert(0, _sp)
++            from eval_robustdex import run_eval as run_rdx
++            run_rdx(cfg, env)
++
++        elif cfg["debug"] == "rdx_frame_check":
++            import sys as _sys
++            _sp = os.path.join(os.environ["DG_REPRO"], "robustdex")  # DG_REPRO = env.sh / _common.sh
++            if _sp not in _sys.path:
++                _sys.path.insert(0, _sp)
++            from frame_check import run_frame_check
++            run_frame_check(cfg, env)
++
++        elif cfg["debug"] == "eval_student":
++            # student RGB-rollout eval (see demograsp_repro/student/eval_student.py)
++            import sys as _sys
++            _sp = os.path.join(os.environ["DG_REPRO"], "student")  # DG_REPRO = env.sh / _common.sh
++            if _sp not in _sys.path:
++                _sys.path.insert(0, _sp)
++            from eval_student import run_eval
++            run_eval(cfg, env)
++
++        elif cfg["debug"] == "eval_groot":
++            # GR00T-style student (SigLIP-2 + flow-matching head) RGB-rollout eval
++            import sys as _sys
++            _sp = os.path.join(os.environ["DG_REPRO"], "student")  # DG_REPRO = env.sh / _common.sh
++            if _sp not in _sys.path:
++                _sys.path.insert(0, _sp)
++            from eval_student_groot import run_eval as _run_groot
++            _run_groot(cfg, env)
++
++        elif cfg["debug"] == "eval_ours":
++            # ours (Inspire, VT-JEPA + RDT1D) closed-loop policy ported into DemoGrasp env
++            import sys as _sys
++            _sp = os.path.join(os.environ["DG_REPRO"], "ours")  # DG_REPRO = env.sh / _common.sh
++            if _sp not in _sys.path:
++                _sys.path.insert(0, _sp)
++            from eval_ours import run_eval as _run_ours
++            _run_ours(cfg, env)
++
++        elif cfg["debug"] == "dump_edits":
++            # teacher 12-D edit dump for grasp-strategy analysis
++            import sys as _sys
++            _sp = os.path.join(os.environ["DG_REPRO"], "analysis")  # DG_REPRO = env.sh / _common.sh
++            if _sp not in _sys.path:
++                _sys.path.insert(0, _sp)
++            from grasp_strategy import dump_edits
++            dump_edits(cfg, env)
++
+         else:
+             for t in range(100000):
+                 action = env.no_op_action
+diff --git a/tasks/grasp.py b/tasks/grasp.py
+index 93b187e..177c4d8 100644
+--- a/tasks/grasp.py
++++ b/tasks/grasp.py
+@@ -13,6 +13,14 @@ from isaacgym import gymapi
+ 
+ from isaacgymenvs.utils.torch_jit_utils import *
+ from isaacgymenvs.tasks.base.vec_task import VecTask
++
++# to_torch defaults device to 'cuda:0'; many calls below omit device= and would land on
++# GPU0 regardless of sim_device, breaking multi-GPU (no-mask) collection. Override to use the
++# current CUDA device (set via torch.cuda.set_device in run_rl_grasp.main). See demograsp_repro/COLLECTION.md §6.
++def to_torch(x, dtype=torch.float, device=None, requires_grad=False):
++    if device is None:
++        device = torch.device(f"cuda:{torch.cuda.current_device()}") if torch.cuda.is_available() else torch.device("cpu")
++    return torch.tensor(x, dtype=dtype, device=device, requires_grad=requires_grad)
+ #import glfw, types
+ from .reward import REWARD_DICT
+ from .utils import batch_linear_interpolate_poses, COLORS_DICT, load_object_point_clouds, transform_points
+@@ -165,7 +173,7 @@ class Grasp(VecTask):
+             self.fixed_camera_ids = [i for i in self.camera_ids if self.camera_cfg[f'camera_{i}']['mount'] == 'fixed']
+             self.save_depth_range = self.render_cfg["save_depth_range"]
+             self.depth_ranges = [self.camera_cfg[f'camera_{i}']['depth_range'] for i in self.camera_ids]
+-            self.camera_handles = []
++            self.camera_handles = [[] for i in range(len(self.camera_ids))]
+             if "depth" in self.render_data_type or "pcl" in self.render_data_type:
+                 self.camera_depth_tensor_lists = [[] for i in range(len(self.camera_ids))]
+             if "seg" in self.render_data_type:
+@@ -177,6 +185,32 @@ class Grasp(VecTask):
+         self.enable_pcl = self.cfg["env"]["enablePointCloud"]
+         self.points_per_object = self.cfg["env"]["pointsPerObject"]
+ 
++        # --- visual-robustness perturbation on objpcl (mirrors exp105 perturbation.py) ---
++        # OFF (prob=0 & occlusion=none) => objpcl obs path byte-identical to original.
++        _occ_presets = {"none": (0.0, 0.0), "mid": (0.1, 0.002), "heavy": (0.3, 0.005)}
++        self._perturb_drop_prob = float(self.cfg["env"].get("perturbFrameDropProb", 0.0))
++        _occ = str(self.cfg["env"].get("perturbOcclusion", "none"))
++        assert _occ in _occ_presets, f"perturbOcclusion={_occ!r} not in {list(_occ_presets)}"
++        self._perturb_dropout, self._perturb_noise = _occ_presets[_occ]
++        self._perturb_on = (self._perturb_drop_prob > 0.0) or (_occ != "none")
++        self._perturb_rng = torch.Generator()  # CPU RNG, reproducible
++        self._perturb_rng.manual_seed(int(self.cfg["env"].get("perturbSeed", 42)))
++        self._perturb_last_pcl = None   # (num_envs, P, 3) hold-last buffer, lazily created
++        self._perturb_valid = None      # (num_envs,) bool: buffer valid per env
++
++        # --- physical-robustness perturbation: plan anchor noise + object disturbance ---
++        # OFF (all magnitudes 0) => plan anchor == GT object pos and no root state is written.
++        self._anchor_noise_xy = float(self.cfg["env"].get("anchorNoiseXY", 0.0))
++        self._disturb_approach_offset = float(self.cfg["env"].get("disturbApproachOffset", 0.0))
++        self._disturb_approach_k = int(self.cfg["env"].get("disturbApproachK", 5))
++        self._disturb_postgrasp_vel = float(self.cfg["env"].get("disturbPostGraspVel", 0.0))
++        self._disturb_postgrasp_k = int(self.cfg["env"].get("disturbPostGraspK", 4))
++        self._disturb_on = (self._disturb_approach_offset > 0.0) or (self._disturb_postgrasp_vel > 0.0)
++        self._disturb_rng = torch.Generator()  # CPU RNG, reproducible, separate from _perturb_rng
++        self._disturb_rng.manual_seed(int(self.cfg["env"].get("disturbSeed", 42)))
++        # NOTE: plan_anchor_pos is allocated in _create_envs(), where object_init_states first exists
++        # (init_configs runs before super().__init__() -> create_sim -> _create_envs).
++
+ 
+     def create_sim(self):
+         self.dt = self.cfg["sim"]["dt"]
+@@ -234,7 +268,7 @@ class Grasp(VecTask):
+             cam_props = gymapi.CameraProperties()
+             cam_props.width = self.camera_cfg[name]['width']
+             cam_props.height = self.camera_cfg[name]['height']
+-            cam_props.enable_tensors = True
++            cam_props.enable_tensors = False  # CPU path: driver 580 breaks cudaImportExternalMemory (GPU tensor interop)
+             cam_props.horizontal_fov = fov_x
+ 
+             ### add fixed cameras
+@@ -266,20 +300,8 @@ class Grasp(VecTask):
+                 #local_transform.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(0,0,1), np.radians(45))
+                 self.gym.attach_camera_to_body(cam_handle, env_ptr, rigid_body_handle, local_transform, gymapi.FOLLOW_TRANSFORM)
+ 
+-            raw_rgb_tensor = self.gym.get_camera_image_gpu_tensor(self.sim, env_ptr, cam_handle, gymapi.IMAGE_COLOR)
+-            rgb_tensor = gymtorch.wrap_tensor(raw_rgb_tensor)
+-            self.camera_rgb_tensor_lists[i].append(rgb_tensor)
+-            if "depth" in self.render_data_type or "pcl" in self.render_data_type:
+-                raw_depth_tensor = self.gym.get_camera_image_gpu_tensor(self.sim, env_ptr, cam_handle, gymapi.IMAGE_DEPTH)
+-                depth_tensor = gymtorch.wrap_tensor(raw_depth_tensor)
+-                self.camera_depth_tensor_lists[i].append(depth_tensor)
+-            if "seg" in self.render_data_type:
+-                raw_seg_tensor = self.gym.get_camera_image_gpu_tensor(
+-                    self.sim, env_ptr, cam_handle, gymapi.IMAGE_SEGMENTATION
+-                )
+-                seg_tensor = gymtorch.wrap_tensor(raw_seg_tensor)
+-                self.camera_seg_tensor_lists[i].append(seg_tensor)
+-            self.camera_handles.append(cam_handle)
++            # CPU capture path: store (env, handle); images fetched per-step via get_camera_image
++            self.camera_handles[i].append((env_ptr, cam_handle))
+ 
+ 
+     def _create_envs(self, num_envs, spacing, num_per_row):
+@@ -351,6 +373,7 @@ class Grasp(VecTask):
+         self.eef_idx =  []
+         self.robot_indices = []
+         self.object_indices = []
++        self.object_mass_list = []  # per-env object mass [kg], for eval instrumentation
+         self.distractor_object_indices = []
+         self.table_indices = []
+         self.robot_start_states = []
+@@ -412,6 +435,10 @@ class Grasp(VecTask):
+                 object_rb_props[j].friction = self.cfg["env"]["objectFriction"]
+             self.gym.set_actor_rigid_shape_properties(env_ptr, object_handle, object_rb_props)
+ 
++            # collect object mass (sum over bodies if the object is multi-body)
++            object_body_props = self.gym.get_actor_rigid_body_properties(env_ptr, object_handle)
++            self.object_mass_list.append(float(sum(p.mass for p in object_body_props)))
++
+             # add distractor objects
+             if self.use_distractor_objects:
+                 for j in range(self.num_distractor_objects):
+@@ -524,6 +551,8 @@ class Grasp(VecTask):
+         self.object_init_states = to_torch(
+             self.object_init_states, device=self.device
+         ).view(num_envs, 13)
++        # anchor used by the reaching plan / reference tracking (== object_init_states[:,0:3] when noise off)
++        self.plan_anchor_pos = self.object_init_states[:, 0:3].clone()
+         self.fingertip_handles = to_torch(
+             self.fingertip_handles, dtype=torch.long, device=self.device
+         )
+@@ -536,6 +565,18 @@ class Grasp(VecTask):
+         self.object_indices = to_torch(
+             self.object_indices, dtype=torch.long, device=self.device
+         )
++        # per-env object mass / name, for eval instrumentation only (not used by env dynamics)
++        self.object_masses = to_torch(
++            self.object_mass_list, dtype=torch.float, device=self.device
++        ).view(num_envs)
++        object_fns = getattr(self, "object_fns", None)
++        if object_fns:
++            self.object_names = [
++                os.path.splitext(os.path.basename(object_fns[i % len(object_fns)]))[0]
++                for i in range(num_envs)
++            ]
++        else:
++            self.object_names = ["object"] * num_envs
+         if self.use_distractor_objects:
+             self.distractor_object_indices = to_torch(
+                 self.distractor_object_indices, dtype=torch.long, device=self.device
+@@ -796,6 +837,7 @@ class Grasp(VecTask):
+         asset_options.collapse_fixed_joints = True
+         asset_options.thickness = 0.001
+         asset_options.angular_damping = 0.01
++        asset_options.density = self.cfg["env"]["objectDensity"]
+         if self.cfg["env"]["useObjectVhacd"]:
+             asset_options.vhacd_enabled = True
+             asset_options.vhacd_params = gymapi.VhacdParams()
+@@ -911,6 +953,10 @@ class Grasp(VecTask):
+ 
+ 
+     def reset_idx(self, env_ids, object_init_pose=None, **kwargs):
++        # invalidate hold-last perturbation buffer for reset envs (fresh episode, no staleness carryover)
++        if getattr(self, "_perturb_valid", None) is not None:
++            self._perturb_valid[env_ids] = False
++
+         ## randomization can happen only at reset time, since it can reset actor positions on GPU
+         if self.randomize:
+             self.apply_randomizations(self.randomization_params)
+@@ -1196,7 +1242,6 @@ class Grasp(VecTask):
+             self.gym.fetch_results(self.sim, True)
+             self.gym.step_graphics(self.sim)
+             self.gym.render_all_camera_sensors(self.sim)
+-            self.gym.start_access_image_tensors(self.sim)
+             for env_id in env_ids:
+                 for t in self.rgb_tensors:
+                     t[env_id] = 0.0
+@@ -1207,7 +1252,6 @@ class Grasp(VecTask):
+                     for t in self.seg_tensors:
+                         t[env_id] = 0
+                 #self.seg_tensor[env_id] = 0.0
+-            self.gym.end_access_image_tensors(self.sim)
+         
+         self.gym.refresh_dof_state_tensor(self.sim)
+         self.gym.refresh_actor_root_state_tensor(self.sim)
+@@ -1220,9 +1264,17 @@ class Grasp(VecTask):
+         self.obs_dict["obs"] = torch.clamp(self.obs_buf, -self.clip_obs, self.clip_obs).to(self.rl_device)
+         self.object_init_states[env_ids] = self.root_state_tensor[self.object_indices[env_ids]].clone()
+         self.cur_ee_targets = self.rigid_body_states.view(-1, 13)[self.eef_idx, 0:7].clone()
+-        
++
+         #print(self.instructions)
+ 
++        # plan anchor: GT settled object pos, optionally corrupted in xy only (object itself untouched)
++        self.plan_anchor_pos[env_ids] = self.object_init_states[env_ids, 0:3].clone()
++        if self._anchor_noise_xy > 0.0:
++            anchor_noise = torch.randn(
++                (len(env_ids), 2), generator=self._disturb_rng
++            ).to(self.device) * self._anchor_noise_xy
++            self.plan_anchor_pos[env_ids, 0:2] += anchor_noise
++
+         self.generate_reaching_plan_idx(env_ids)
+         if self.obs_type == "eefpose+objinitpose+pcfeat":
+             self.obs_objinitpose = self.obs_dict["obs"][:, 7:14]
+@@ -1292,7 +1344,7 @@ class Grasp(VecTask):
+ 
+         wrist_pose = self.rigid_body_states.view(-1, 13)[self.eef_idx[env_ids], 0:7] # [B, 7]
+         wrist_pose_target = torch.cat([
+-            self.current_tracking_reference["wrist_initobj_pos"][env_ids, 0] + self.object_init_states[env_ids,0:3],
++            self.current_tracking_reference["wrist_initobj_pos"][env_ids, 0] + self.plan_anchor_pos[env_ids],
+             self.current_tracking_reference["wrist_quat"][env_ids, 0]
+         ], dim=-1) # [B, 7]
+ 
+@@ -1318,7 +1370,7 @@ class Grasp(VecTask):
+         tracking_timestep_ids = (self.progress_buf - self.reaching_plan_timesteps).clamp(min=0, max=self.T_ref-1)
+         wrist_pose_tracking_target = torch.cat([
+             self.current_tracking_reference["wrist_initobj_pos"][env_ids, tracking_timestep_ids] \
+-            + self.object_init_states[:, 0:3],
++            + self.plan_anchor_pos,
+             self.current_tracking_reference["wrist_quat"][env_ids, tracking_timestep_ids]
+         ], dim=-1) * (self.progress_buf >= self.reaching_plan_timesteps).unsqueeze(-1).float() # [B, 7]
+         wrist_pose_target = wrist_pose_reaching_target + wrist_pose_tracking_target
+@@ -1389,7 +1441,42 @@ class Grasp(VecTask):
+             raise NotImplementedError
+         #print(action[:, 0:7].abs().max())
+         return action
+-    
++
++
++    # physical-robustness disturbance injected into the OBJECT root state (OFF by default)
++    def _apply_disturbance(self):
++        if not self._disturb_on:
++            return
++
++        def random_horizontal_dirs(n):
++            angles = torch.rand(n, generator=self._disturb_rng).to(self.device) * (2 * np.pi)
++            return torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
++
++        def push_to_sim(mask):
++            indices = self.object_indices[mask].to(torch.int32)
++            self.gym.set_actor_root_state_tensor_indexed(
++                self.sim,
++                gymtorch.unwrap_tensor(self.root_state_tensor),
++                gymtorch.unwrap_tensor(indices),
++                len(indices),
++            )
++
++        # pre-contact: displace the object horizontally, leave its velocities alone
++        if self._disturb_approach_offset > 0.0:
++            mask = (self.progress_buf == self.reaching_plan_timesteps + self._disturb_approach_k)
++            if mask.any():
++                dirs = random_horizontal_dirs(int(mask.sum()))
++                self.root_state_tensor[self.object_indices[mask], 0:2] += dirs * self._disturb_approach_offset
++                push_to_sim(mask)
++
++        # post-lift: kick the object with a horizontal velocity
++        if self._disturb_postgrasp_vel > 0.0:
++            mask = (self.progress_buf == self.reaching_plan_timesteps + self.T_ref_start_lifting + self._disturb_postgrasp_k)
++            if mask.any():
++                dirs = random_horizontal_dirs(int(mask.sum()))
++                self.root_state_tensor[self.object_indices[mask], 7:9] += dirs * self._disturb_postgrasp_vel
++                push_to_sim(mask)
++
+ 
+     def step(self, actions):
+         # randomize actions
+@@ -1397,6 +1484,8 @@ class Grasp(VecTask):
+             actions = self.dr_randomizations['actions']['noise_lambda'](actions)
+ 
+         action_tensor = torch.clamp(actions, -self.clip_actions, self.clip_actions)
++        # inject object disturbance (no-op unless enabled) before this step's physics
++        self._apply_disturbance()
+         # apply actions
+         self.pre_physics_step(action_tensor)
+ 
+@@ -1537,13 +1626,19 @@ class Grasp(VecTask):
+             self.gym.fetch_results(self.sim, True)
+             self.gym.step_graphics(self.sim)
+             self.gym.render_all_camera_sensors(self.sim)
+-            self.gym.start_access_image_tensors(self.sim)
+-            self.rgb_tensors = [torch.stack([i for i in self.camera_rgb_tensor_lists[j]], dim=0) for j in range(len(self.camera_ids))]
+-            if "depth" in self.render_data_type or "pcl" in self.render_data_type: 
+-                self.depth_tensors = [-torch.stack([i for i in self.camera_depth_tensor_lists[j]], dim=0) for j in range(len(self.camera_ids))]
+-            if "seg" in self.render_data_type:
+-                self.seg_tensors = [torch.stack([i for i in self.camera_seg_tensor_lists[j]], dim=0) for j in range(len(self.camera_ids))]
+-            self.gym.end_access_image_tensors(self.sim)
++            # CPU capture path (get_camera_image on host; avoids broken CUDA-Vulkan interop)
++            for j, cam_id in enumerate(self.camera_ids):
++                rgb_list, depth_list = [], []
++                for (env_ptr, cam_handle) in self.camera_handles[j]:
++                    rgb = self.gym.get_camera_image(self.sim, env_ptr, cam_handle, gymapi.IMAGE_COLOR)
++                    rgb = np.asarray(rgb).reshape(rgb.shape[0], -1, 4)  # (H, W, 4) uint8
++                    rgb_list.append(torch.from_numpy(rgb.astype(np.uint8)))
++                    if "depth" in self.render_data_type or "pcl" in self.render_data_type:
++                        d = np.asarray(self.gym.get_camera_image(self.sim, env_ptr, cam_handle, gymapi.IMAGE_DEPTH))
++                        depth_list.append(torch.from_numpy(d.copy()))
++                self.rgb_tensors[j] = torch.stack(rgb_list, dim=0).to(self.device)
++                if "depth" in self.render_data_type or "pcl" in self.render_data_type:
++                    self.depth_tensors[j] = (-torch.stack(depth_list, dim=0)).to(self.device)
+             if "depth" in self.render_data_type or "pcl" in self.render_data_type:
+                 for i in range(len(self.camera_ids)):
+                     self.depth_tensors[i] = torch.where(
+@@ -1642,6 +1737,8 @@ class Grasp(VecTask):
+         
+         if "objpcl" in obs_type: # object point cloud
+             self.transformed_pcl = self.transform_obj_pcl_2_world()
++            if self._perturb_on:
++                self.transformed_pcl = self._apply_pcl_perturbation(self.transformed_pcl)
+             obs_buf[:, obs_end: obs_end+self.points_per_object*3] = self.transformed_pcl.reshape(self.num_envs,-1)
+             obs_end += self.points_per_object*3
+         
+@@ -1664,6 +1761,38 @@ class Grasp(VecTask):
+         pcl = pcl + o2w_pos
+         return pcl
+ 
++    def _apply_pcl_perturbation(self, pcl):
++        """Visual-robustness degradation on the world-frame object pcl (num_envs, P, 3).
++        Mirrors exp105 perturbation.py: occlusion (random_dropout + depth noise, fixed
++        n_points) applied first, then per-env hold-last frame-drop (staleness)."""
++        N, P, _ = pcl.shape
++        # ---- occlusion: gaussian depth noise + random_dropout (dim preserved) ----
++        if self._perturb_noise > 0.0:
++            pcl = pcl + torch.randn_like(pcl) * self._perturb_noise
++        if self._perturb_dropout > 0.0:
++            n_drop = int(round(self._perturb_dropout * P))
++            if n_drop > 0:
++                # per-env: overwrite n_drop points with resampled kept points (missing -> resampled)
++                drop_idx = torch.randint(0, P, (N, n_drop), device=pcl.device)
++                keep_src = torch.randint(0, P, (N, n_drop), device=pcl.device)
++                batch = torch.arange(N, device=pcl.device).unsqueeze(1).expand(-1, n_drop)
++                pcl[batch, drop_idx] = pcl[batch, keep_src]
++        # ---- frame-drop: per-env hold-last staleness ----
++        if self._perturb_drop_prob > 0.0:
++            if self._perturb_last_pcl is None or self._perturb_last_pcl.shape != pcl.shape:
++                self._perturb_last_pcl = pcl.clone()
++                self._perturb_valid = torch.zeros(N, dtype=torch.bool, device=pcl.device)
++            drop = torch.bernoulli(torch.full((N,), self._perturb_drop_prob),
++                                   generator=self._perturb_rng).to(pcl.device).bool()
++            use_last = drop & self._perturb_valid   # only hold when we have a valid past frame
++            out = torch.where(use_last.view(N, 1, 1), self._perturb_last_pcl, pcl)
++            # update buffer for envs that passed fresh through
++            fresh = ~use_last
++            self._perturb_last_pcl[fresh] = pcl[fresh]
++            self._perturb_valid[fresh] = True
++            pcl = out
++        return pcl
++
+ 
+     ### convert (delta) target ee pose to delta joint angles of the arm
+     def compute_arm_ik(self, action, is_delta_pose=True, is_delta_pose_in_world=True, reference_state=None):
+@@ -1755,8 +1884,10 @@ class Grasp(VecTask):
+ 
+     # get obs same to the real-world
+     def compute_real_observation_dict(self):
++        # self.instructions is only populated during render randomization; fall back to the template
++        instructions = getattr(self, "instructions", [self.instruction_template] * self.num_envs)
+         obs_dict = {
+-            "instruction": self.instructions, # [num_envs] str 
++            "instruction": instructions, # [num_envs] str
+             "right_arm_qpos": self.robot_dof_pos[:, self.arm_dof_indices].cpu().numpy(), # [num_envs, 7]
+             "right_arm_eef_pose": self.rigid_body_states.view(-1, 13)[self.eef_idx, 0:7].cpu().numpy(), # [num_envs, 7]
+             "right_hand_qpos": self.robot_dof_pos[:, self.active_hand_dof_indices].cpu().numpy(), # [num_envs, 6]
+diff --git a/tasks/task/grasp.yaml b/tasks/task/grasp.yaml
+index 240b1f1..548fb7c 100644
+--- a/tasks/task/grasp.yaml
++++ b/tasks/task/grasp.yaml
+@@ -18,6 +18,7 @@ env:
+   enableSelfCollision: False # robot self-collision
+   enableRobotTableCollision: True # robot-table collision; if False, set 1/2 envs to be collision-free
+   objectFriction: 1.0
++  objectDensity: 1000.0 # kg/m^3; IsaacGym AssetOptions default = 1000 (identical to existing behavior)
+ 
+   clipObservations: 5.0
+   clipActions: 1.0
+@@ -52,6 +53,19 @@ env:
+   observationType: "armdof+handdof+eefpose+objpose"
+   enablePointCloud: False # load object downsampled pcls
+   pointsPerObject: 512
++  # --- visual-robustness perturbation on objpcl (mirrors exp105 perturbation.py) ---
++  # defaults OFF => objpcl obs path is byte-identical to original.
++  perturbFrameDropProb: 0.0   # per-env per-step hold-last Bernoulli prob on objpcl (e.g. 0/0.5/0.9)
++  perturbOcclusion: "none"    # none/mid/heavy => random_dropout + depth-noise on objpcl
++  perturbSeed: 42
++  # --- physical-robustness perturbation: plan anchor noise + object disturbance ---
++  # defaults OFF => plan anchor == GT object pose and no disturbance is injected.
++  anchorNoiseXY: 0.0      # m, std of gaussian noise on the PLAN anchor only (object untouched). 0 = off
++  disturbApproachOffset: 0.0   # m, horizontal displacement applied to the OBJECT pre-contact. 0 = off
++  disturbApproachK: 5          # applied when progress_buf == reaching_plan_timesteps + K (fingers close at +11)
++  disturbPostGraspVel: 0.0     # m/s, horizontal velocity kick applied to the OBJECT post-lift. 0 = off
++  disturbPostGraspK: 4         # applied when progress_buf == reaching_plan_timesteps + T_ref_start_lifting + K
++  disturbSeed: 42
+   rewardType: "binary"
+   trackingReferenceFile: "tasks/grasp_ref_inspire.pkl"
+   trackingReferenceLiftTimestep: 13 # timestep to start lifting
+diff --git a/eval_report.py b/eval_report.py
+new file mode 100644
+index 0000000..765b578
+--- /dev/null
++++ b/eval_report.py
+@@ -0,0 +1,107 @@
++"""Opt-in per-episode evaluation instrumentation (`debug=eval_report`).
++
++Reproduces the `is_testing` eval loop of algo/ppo_onestep/ppo.py exactly, but records
++one CSV row per (round, env) instead of only printing the per-round success rate.
++Does not alter env behavior in any way.
++"""
++
++import csv
++
++import torch
++
++
++CSV_FIELDS = [
++    "round", "env_id", "object_name", "mass_kg",
++    "init_x", "init_y", "init_z", "init_qx", "init_qy", "init_qz", "init_qw",
++    "delta_z", "success", "has_hit_table", "settled_bbox_z", "settled_footprint",
++]
++
++
++def _settled_pcl_extents(env):
++    """World-frame AABB of the settled object pcl: (z-extent, max horizontal extent).
++
++    Must be called right after settling (before any stepping/disturbance).
++    Returns two python lists of length num_envs, NaN-filled when pcl is unavailable.
++    """
++    nan = float("nan")
++    if not getattr(env, "enable_pcl", False) or not hasattr(env, "transform_obj_pcl_2_world"):
++        return [nan] * env.num_envs, [nan] * env.num_envs
++
++    pcl = env.transform_obj_pcl_2_world()  # (num_envs, P, 3)
++    ext = pcl.max(dim=1).values - pcl.min(dim=1).values  # (num_envs, 3)
++    bbox_z = ext[:, 2].cpu().tolist()
++    footprint = torch.maximum(ext[:, 0], ext[:, 1]).cpu().tolist()
++    return bbox_z, footprint
++
++
++def eval_report(cfg, env):
++    from run_rl_grasp import build_runner
++
++    runner = build_runner(cfg, env)
++    policy = runner.actor_critic
++    policy.eval()
++
++    num_rounds = cfg.get("num_rounds", 10)
++    out_path = cfg.get("report_csv", "eval_report.csv")
++
++    object_names = getattr(env, "object_names", None)
++    object_masses = getattr(env, "object_masses", None)
++    if object_masses is not None:
++        object_masses = object_masses.cpu().tolist()
++
++    all_env_ids = torch.arange(env.num_envs)
++    round_success_rates = []
++    total_success, total_episodes = 0.0, 0
++
++    with open(out_path, "w", newline="") as f:
++        writer = csv.writer(f)
++        writer.writerow(CSV_FIELDS)
++
++        for round in range(num_rounds):
++            current_obs = env.reset_idx(all_env_ids)["obs"]
++            current_states = env.get_state()
++            with torch.no_grad():
++                actions = policy(current_obs, current_states, inference=True)
++            env.generate_reaching_plan_idx(all_env_ids, actions=actions)
++
++            # settled geometry: measured now, before any stepping/disturbance
++            settled_bbox_z, settled_footprint = _settled_pcl_extents(env)
++
++            for t in range(env.max_episode_length):
++                env_action = env.compute_reference_actions()
++                obs, reward, reset, extras = env.step(env_action)
++                if (t == env.max_episode_length - 2):
++                    successs = env.successes.clone().to(env.device)
++                    print(f"Round {round}, success rate: {successs.sum()/successs.shape[0]}")
++
++                    successes = successs.cpu().tolist()
++                    has_hit_table = env.has_hit_table.cpu().tolist()
++                    init_states = env.object_init_states[:, 0:7].cpu().tolist()
++                    object_z = env.object_pos[:, 2].cpu().tolist()
++
++                    for i in range(env.num_envs):
++                        init = init_states[i]
++                        writer.writerow([
++                            round, i,
++                            object_names[i] if object_names is not None else "unknown",
++                            object_masses[i] if object_masses is not None else float("nan"),
++                            init[0], init[1], init[2],
++                            init[3], init[4], init[5], init[6],
++                            object_z[i] - init[2],
++                            successes[i],
++                            int(has_hit_table[i]),
++                            settled_bbox_z[i], settled_footprint[i],
++                        ])
++                    f.flush()
++
++                    rate = float(successs.sum() / successs.shape[0])
++                    round_success_rates.append(rate)
++                    total_success += float(successs.sum())
++                    total_episodes += env.num_envs
++
++    print("\n=== eval_report summary ===")
++    for round, rate in enumerate(round_success_rates):
++        print(f"Round {round}, success rate: {rate}")
++    overall = (total_success / total_episodes) if total_episodes > 0 else float("nan")
++    print(f"Overall success rate: {overall} ({total_episodes} episodes)")
++    print(f"Wrote per-episode report to: {out_path}")

@@ -23,10 +23,10 @@
 
 | | |
 |---|---|
-| 머신 | kimm-h200 (**GPU 0·1 만** — 공용 서버) |
-| 평가 env | DemoGrasp (IsaacGym Preview 4), `projects/tacdexgrasp/references/DemoGrasp` — ★ 남의 코드, 고치지 않는다 |
-| conda env | `demograsp` (py3.8) — `conda activate` 금지, 절대경로 실행 |
-| 부팅 | `source scripts/_common.sh` |
+| 머신 | kimm-h200 (원 실험) · lecun (확장 중) — 새 머신 = `SETUP.md` |
+| 평가 env | DemoGrasp (IsaacGym Preview 4) — ★ 남의 코드, 고치지 않는다 (사본 경로는 `_common.sh` 가 머신별 결정) |
+| conda env | `demograsp` (py3.8.19) — `conda activate` 금지, 절대경로 실행 |
+| 부팅 | `source $VITAC_ROOT/env.sh graspstress` (우산) · `source scripts/_common.sh` (kimm) |
 
 ## 실행
 
