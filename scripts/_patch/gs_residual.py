@@ -24,8 +24,11 @@ import os
 
 _MODE = os.environ.get("GS_RESIDUAL", "")           # "" = 무동작
 _ON = _MODE in ("min", "sum", "zero", "plan_min", "plan_sum",
-                "bmin", "bsum", "plan_bmin", "plan_bsum")
-_BIN = "b" in _MODE.split("_")[-1][:1] or _MODE.split("_")[-1].startswith("b")   # 이진 보상 변형
+                "bmin", "bsum", "plan_bmin", "plan_bsum", "sweep")
+_SWEEP = os.environ.get("GS_RES_SWEEP", "hand")     # hand | posz | posx — 무엇을 쓸어볼지
+_ALLPH = os.environ.get("GS_RES_ALLPHASE", "") not in ("", "0")   # grip 게이팅 해제(접근부터 적용)
+_BIN = (_MODE.split("_")[-1].startswith("b")
+        or os.environ.get("GS_RES_BIN", "") not in ("", "0"))   # 이진 보상 변형
 _THETA = float(os.environ.get("GS_RES_THETA", "20") or 20) / 1000.0   # 이진 임계 (mm -> m)
 _PLAN = _MODE.startswith("plan")          # t=0 계획(12-D edit)에 residual 을 얹는 변형
 _AGG = "min" if _MODE.endswith("min") else "mean"
@@ -162,6 +165,63 @@ def _run(ppo_self):
     G = env._br_G
     log = open(os.path.join(out, "train.csv"), "a")
     log.write("iter,ret,margin_min,margin_mean,succ,nwin,dmax_mm,dmean_mm,dstd\n"); log.flush()
+
+    if _MODE == "sweep":
+        # ★ 감사: 고정된 큰 Δ 를 replica 별로 다르게 넣고 마진이 **움직이기는 하는가** 를 본다.
+        #    안 움직이면 학습 문제가 아니라 하네스/설계 문제다.
+        n_obj = env._br_n_obj
+        R = n // n_obj
+        lev = torch.linspace(-1.0, 1.0, R, device=dev)          # replica 별 Δ 수준
+        rep = (torch.arange(n, device=dev) // n_obj)
+        c = lev[rep]                                             # [n]
+        allenv = torch.arange(env.num_envs, device=dev)
+        acc = {r: {"hold": [], "succ": []} for r in range(R)}
+        print("[res] SWEEP(%s) R=%d levels=%s  (Δpos=±%.3fm, Δhand=±%.3f)"
+              % (_SWEEP, R, [round(float(v), 2) for v in lev], _DPOS, _DHAND), flush=True)
+        for rd in range(5):
+            cur = env.reset_idx(allenv)["obs"]
+            with torch.no_grad():
+                plan = ppo_self.actor_critic(cur, env.get_state(), inference=True)
+            env.generate_reaching_plan_idx(allenv, actions=plan)
+            for t in range(T):
+                ref = env.compute_reference_actions()
+                grip = env._br_grip_mask()[:n].float()
+                dpos = torch.zeros(n, 3, device=dev)
+                dhand = torch.zeros(n, env.num_active_hand_dofs, device=dev)
+                if _SWEEP == "hand":
+                    dhand = c.unsqueeze(-1).expand_as(dhand) * _DHAND
+                elif _SWEEP == "posz":
+                    dpos[:, 2] = c * _DPOS
+                elif _SWEEP == "posx":
+                    dpos[:, 0] = c * _DPOS
+                if not _ALLPH:
+                    dpos = dpos * grip.unsqueeze(-1); dhand = dhand * grip.unsqueeze(-1)
+                act = ref.clone()
+                act[:, 0:3] = act[:, 0:3] + dpos[src]
+                act[:, env.hand_dof_start_idx:] = act[:, env.hand_dof_start_idx:] + dhand[src]
+                env.step(act)
+                if getattr(env, "_br_active_win", False) and env._br_win == 0:
+                    p_ = env.root_state_tensor[env.object_indices, 0:3]
+                    dd = torch.stack([torch.norm(p_[g * n:(g + 1) * n] - p_[:n], dim=-1)
+                                      for g in range(2, G)], 0)
+                    _, per = _reward(dd, torch)
+                    gm = env._br_grip_mask()[:n]
+                    for r in range(R):
+                        m_ = gm & (rep == r)
+                        if bool(m_.any()):
+                            acc[r]["hold"].append(per[:, m_].mean(1).detach().cpu().numpy())
+            sc = (env.successes[:n] > 0.5).float()
+            for r in range(R):
+                acc[r]["succ"].append(float(sc[rep == r].mean()))
+        print("\n[res] === Δ 민감도 감사 (sweep=%s) ===" % _SWEEP, flush=True)
+        print("[res] %8s %8s | %s | %8s %8s" % ("Δ수준", "liftSR", " ".join("%6s" % d for d in
+              ["+x", "-x", "+y", "-y", "+z", "-z"]), "hold평균", "all6"), flush=True)
+        for r in range(R):
+            h = np.mean(np.stack(acc[r]["hold"]), 0)
+            print("[res] %8.2f %8.3f | %s | %8.3f %8.3f"
+                  % (float(lev[r]), float(np.mean(acc[r]["succ"])),
+                     " ".join("%6.3f" % v for v in h), float(h.mean()), float(np.prod(h))), flush=True)
+        raise SystemExit(0)
 
     if _EVAL:
         print("[res] EVAL — 원 eval 루프 10 라운드, residual 은 결정적(mean) 주입", flush=True)
