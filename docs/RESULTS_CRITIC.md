@@ -1,6 +1,6 @@
 # RESULTS — 버팀 카운트 critic 컨셉 검증 (2026-09-29)
 
-> 사전등록 = [`EXP_CRITIC.md`](EXP_CRITIC.md) (판정 규칙은 수치 보기 전 고정) · 수치 = [`../results/critic_concept.md`](../results/critic_concept.md)
+> 사전등록 = [`EXP_CRITIC.md`](EXP_CRITIC.md) (판정 규칙은 수치 보기 전 고정) · 수치 = [`../results/critic_concept__kimm.md`](../results/critic_concept__kimm.md)
 > 선행 = [`RESULTS_RESIDUAL.md`](RESULTS_RESIDUAL.md) (residual RL 6변형 null) · [`RESULTS_BRANCH.md`](RESULTS_BRANCH.md) (반쪽 케이지)
 
 ## 0. 한 줄

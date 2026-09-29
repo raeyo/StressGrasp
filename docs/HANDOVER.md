@@ -37,7 +37,7 @@ GPU 는 검증 재생에만 쓴다. 착수 전에 `docs/EXP_S1.md` 로 **사전�
 |---|---|---|
 | 버팀 카운트 라벨 데이터셋 | `runs/critic/ds_s4{2,3,4,5}/data.npz` | 46,425 후보 × 3회 측정, 장면 180 |
 | 그 안의 내용 | 특권 55-d · palm PCL 256점 · 12-D 계획 · 6방향 hold ×3 · lift · 물체/장면/σ id | — |
-| 판정 결과 | `results/critic_concept.{md,json}` · `results/critic_run.txt` | — |
+| 판정 결과 | `results/critic_concept.{md,json}` · `results/critic_run__kimm.txt` | — |
 | 선행 오라클 해 | `runs/residual/oracle_s4{2,3}/oracle.npz` | 물체별 12-D + 고정 자세 |
 
 ★ `runs/` 는 gitignore = 레포 밖 취급. **다른 머신으로 옮기려면 별도 복사**해야 한다.

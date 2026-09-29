@@ -57,7 +57,7 @@ python3 scripts/20_summarize.py
 ## critic 라인 (2026-09-29~)
 
 버팀 카운트(0~6)를 **RL 보상이 아니라 라벨**로 쓰는 노선. 사전등록 [`docs/EXP_CRITIC.md`](docs/EXP_CRITIC.md)
-· 판독 [`docs/RESULTS_CRITIC.md`](docs/RESULTS_CRITIC.md) · 수치 [`results/critic_concept.md`](results/critic_concept.md).
+· 판독 [`docs/RESULTS_CRITIC.md`](docs/RESULTS_CRITIC.md) · 수치 [`results/critic_concept__kimm.md`](results/critic_concept__kimm.md).
 
 ```bash
 GS_GPU=0 GS_SEED=42 bash scripts/50_dataset.sh ds_s42 55      # 라벨 생성 (3회 반복 측정)

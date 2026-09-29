@@ -170,4 +170,4 @@ CEM 후보를 쓴 값이고 여기는 8개 무작위 후보이므로, 그 **25%*
 ★ 이 결정은 **전체 데이터의 G-B 결과를 보기 전에** 내렸다. 모델 구조·하이퍼파라미터
 (MLP 256-128, PointNet 64-128-128, Adam 1e-3, wd 1e-5, early stop patience 10)는
 **여기서 동결**하고 결과를 본 뒤 조정하지 않는다. 부분 데이터에서 본 수치는
-`results/critic_concept.md` 에 참고로 병기한다.
+`results/critic_concept__kimm.md` 에 참고로 병기한다.

@@ -136,7 +136,7 @@ def main(paths):
                cnt_all=float(C.mean()), sr_all=float(S.mean()),
                sigma_label_w1=float(np.sqrt(msw1)), icc_pre_w1=float(ab1))
     if not gA:
-        json.dump(res, open("results/critic_concept.json", "w"), indent=1)
+        json.dump(res, open("results/critic_concept__kimm.json", "w"), indent=1)
         return res
 
     # ---------------------------------------------------------------- G-B 예측
@@ -250,7 +250,7 @@ def main(paths):
                gc_diff=float(dif.mean()), gc_ci=[float(lo), float(hi)], eta=float(eta),
                gC1=bool(gC1), gC2=bool(gC2), gB=bool(gB))
     os.makedirs("results", exist_ok=True)
-    json.dump(res, open("results/critic_concept.json", "w"), indent=1)
+    json.dump(res, open("results/critic_concept__kimm.json", "w"), indent=1)
     print("\n>>> 종합: G-A %s · G-B %s · G-C %s"
           % ("통과" if gA else "불통과", "통과" if gB else "불통과", "통과" if (gC1 and gC2) else "불통과"))
     return res
