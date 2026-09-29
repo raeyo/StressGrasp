@@ -24,7 +24,7 @@ import os
 
 _MODE = os.environ.get("GS_RESIDUAL", "")           # "" = 무동작
 _ON = _MODE in ("min", "sum", "zero", "plan_min", "plan_sum",
-                "bmin", "bsum", "plan_bmin", "plan_bsum", "sweep", "oracle")
+                "bmin", "bsum", "plan_bmin", "plan_bsum", "sweep", "oracle", "replay")
 _SWEEP = os.environ.get("GS_RES_SWEEP", "hand")     # hand | posz | posx — 무엇을 쓸어볼지
 _ALLPH = os.environ.get("GS_RES_ALLPHASE", "") not in ("", "0")   # grip 게이팅 해제(접근부터 적용)
 _BIN = (_MODE.split("_")[-1].startswith("b")
@@ -166,6 +166,52 @@ def _run(ppo_self):
     log = open(os.path.join(out, "train.csv"), "a")
     log.write("iter,ret,margin_min,margin_mean,succ,nwin,dmax_mm,dmean_mm,dstd\n"); log.flush()
 
+    if _MODE == "replay":
+        # ★ 오라클 해가 **다른 초기자세로 전이되는가**. 전이되면 "물체 수준에서 학습 가능",
+        #   안 되면 "장면마다 다시 풀어야 하는 문제" 다.
+        n_obj = env._br_n_obj
+        z = np.load(os.environ["GS_RES_ORACLE"])
+        ba = torch.tensor(z["best_action"], dtype=torch.float, device=dev)      # [n_obj, 12]
+        te = torch.tensor(z["teacher"], dtype=torch.float, device=dev)
+        pose0 = torch.tensor(z["pose0"], dtype=torch.float, device=dev)
+        fix = os.environ.get("GS_RES_FIXPOSE", "") not in ("", "0")
+        use_teacher = os.environ.get("GS_RES_USETEACHER", "") not in ("", "0")
+        A = te if use_teacher else ba
+        allenv = torch.arange(env.num_envs, device=dev)
+        obj = env._br_obj[:n]
+        HO = []; SC = []
+        print("[res] REPLAY  %s  자세=%s  n_obj=%d n_main=%d"
+              % ("teacher edit" if use_teacher else "오라클 해", "고정" if fix else "랜덤", n_obj, n), flush=True)
+        for rd in range(10):
+            if fix:
+                pp = pose0.repeat(int(np.ceil(env.num_envs / n_obj)), 1)[:env.num_envs]
+                env.reset_idx(allenv, object_init_pose=pp.cpu().numpy())
+            else:
+                env.reset_idx(allenv)
+            plan = torch.zeros(env.num_envs, A.shape[-1], device=dev)
+            plan[:n] = A[obj]
+            env.generate_reaching_plan_idx(allenv, actions=plan[env._br_src])
+            acc = torch.zeros(n, device=dev); nw = torch.zeros(n, device=dev)
+            for t in range(T):
+                env.step(env.compute_reference_actions())
+                if getattr(env, "_br_active_win", False) and env._br_win == 0:
+                    p_ = env.root_state_tensor[env.object_indices, 0:3]
+                    dd = torch.stack([torch.norm(p_[g2 * n:(g2 + 1) * n] - p_[:n], dim=-1)
+                                      for g2 in range(2, G)], 0)
+                    _, per = _reward(dd, torch)
+                    gm = env._br_grip_mask()[:n].float()
+                    acc += per.mean(0) * gm; nw += gm
+                    HO.append(per[:, gm > 0].mean(1).detach().cpu().numpy() if bool((gm > 0).any()) else np.zeros(6))
+            sc = (env.successes[:n] > 0.5).float()
+            SC.append(float(sc.mean()))
+            print("[res]  round %d  liftSR=%.4f  hold평균=%.4f" % (rd, float(sc.mean()),
+                  float((acc / nw.clamp(min=1))[nw > 0].mean())), flush=True)
+        h = np.mean(np.stack(HO), 0)
+        print("[res] === REPLAY 결과: liftSR=%.4f  hold/dir %s  평균 %.4f ==="
+              % (float(np.mean(SC)), " ".join("%s=%.3f" % (d, v) for d, v in
+                 zip(["+x", "-x", "+y", "-y", "+z", "-z"], h)), float(h.mean())), flush=True)
+        raise SystemExit(0)
+
     if _MODE == "oracle":
         # ★ 물체별 오라클 상한 — 학습 없이 CEM 으로 "이 장면에서 최선의 12-D edit" 을 찾는다.
         #   목적 = 개입 게이트를 **도달 가능한 범위** 위에서 정하기 위함 (RESULTS_RESIDUAL §9).
@@ -176,8 +222,9 @@ def _run(ppo_self):
         allenv = torch.arange(env.num_envs, device=dev)
         gens = int(os.environ.get("GS_RES_GENS", "20") or 20)
         elite = max(2, R // 4)
+        fixpose = os.environ.get("GS_RES_FIXPOSE", "1") not in ("", "0")
         cur = env.reset_idx(allenv)["obs"]
-        pose0 = env.root_state_tensor[env.object_indices, 0:7].clone()   # 안착된 자세를 고정
+        pose0 = env.root_state_tensor[env.object_indices, 0:7].clone()   # 안착된 자세
         pose0 = pose0[:n_obj].repeat(int(np.ceil(env.num_envs / n_obj)), 1)[:env.num_envs]
         with torch.no_grad():
             teach = ppo_self.actor_critic(cur, env.get_state(), inference=True)[:, :dp].clone()
@@ -185,13 +232,16 @@ def _run(ppo_self):
         sd = torch.full_like(mu, float(os.environ.get("GS_RES_SIG", "0.35") or 0.35))
         best = torch.full((n_obj,), -1.0, device=dev); best_a = mu.clone()
         base = None
-        print("[res] ORACLE  n_obj=%d R=%d gens=%d dim=%d sigma0=%.2f  (물체자세 고정, CEM)"
-              % (n_obj, R, gens, dp, float(sd[0, 0])), flush=True)
+        print("[res] ORACLE  n_obj=%d R=%d gens=%d dim=%d sigma0=%.2f  (자세=%s, CEM)"
+              % (n_obj, R, gens, dp, float(sd[0, 0]), "고정" if fixpose else "랜덤(전이가능 상한)"), flush=True)
         for g in range(gens):
             cand = (mu.repeat(R, 1) + sd.repeat(R, 1) * torch.randn(n, dp, device=dev)).clamp(-1, 1)
             if g == 0:
                 cand[:n_obj] = teach[:n_obj]             # 후보 0 = teacher (기준선을 항상 포함)
-            env.reset_idx(allenv, object_init_pose=pose0.cpu().numpy())
+            if fixpose:
+                env.reset_idx(allenv, object_init_pose=pose0.cpu().numpy())
+            else:
+                env.reset_idx(allenv)      # ★ 자세를 매 세대 새로 뽑는다 -> 자세-강건한 해만 살아남는다
             plan = torch.zeros(env.num_envs, dp, device=dev)
             plan[:n] = cand
             env.generate_reaching_plan_idx(allenv, actions=plan[env._br_src])
