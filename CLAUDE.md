@@ -13,6 +13,11 @@
 
 ## 1. 브랜치
 
+- ★ **작업 디렉토리 하나 = 세션 하나 = 브랜치 하나.** 같은 머신에서 세션을 둘 이상 돌리면 두 번째부터는
+  반드시 별도 worktree 를 쓴다: `git worktree add ../graspstress-<주제> -b <태그>/<주제> origin/master`.
+  남의 세션이 체크아웃해 둔 디렉토리에서 커밋하면 **그 세션의 브랜치에 커밋이 섞인다** (2026-09-29 실제 발생:
+  setup 커밋이 `hub/postlift` 위에 올라감 → hub 가 분리함). 커밋 전 `git branch --show-current` 가
+  **자기 브랜치인지** 확인한다.
 - **master 에는 hub 만 push 한다.** 다른 워크스페이스는 master 에 커밋·push 하지 않는다.
 - 작업은 `<태그>/<주제>` 브랜치에서만 한다 (예: `kimm/rdx-port`, `hub/postlift`). **CLAIMS.md 에 배정된 브랜치만** 만든다.
 - 시작: `git fetch origin && git switch -c <태그>/<주제> origin/master`
