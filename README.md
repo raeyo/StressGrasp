@@ -45,3 +45,13 @@ python3 scripts/20_summarize.py
 - `runs/` = 원시 로그 (gitignore, 레포 밖 취급)
 - `results/` = 판독 근거가 되는 요약만 (커밋)
 - `scripts/_patch/` = 남의 코드에 런타임으로 얹는 우리 패치 (D2/D3 용)
+
+## critic 라인 (2026-09-29~)
+
+버팀 카운트(0~6)를 **RL 보상이 아니라 라벨**로 쓰는 노선. 사전등록 [`docs/EXP_CRITIC.md`](docs/EXP_CRITIC.md)
+· 판독 [`docs/RESULTS_CRITIC.md`](docs/RESULTS_CRITIC.md) · 수치 [`results/critic_concept.md`](results/critic_concept.md).
+
+```bash
+GS_GPU=0 GS_SEED=42 bash scripts/50_dataset.sh ds_s42 55      # 라벨 생성 (3회 반복 측정)
+python3 scripts/51_critic.py runs/critic/ds_s*/data.npz        # critic 학습 + 게이트 판정
+```

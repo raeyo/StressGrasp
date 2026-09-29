@@ -1,0 +1,43 @@
+== 데이터 == 후보 46425 (원 47520, nwin=0 제외 2.3%)  반복 3  장면 180  물체 33
+   teacher(slot0) 카운트=3.098 liftSR=0.751 | 전체 카운트=2.913 liftSR=0.593
+   sigma=0.00 n= 5887 카운트=3.098 liftSR=0.751
+   sigma=0.05 n=17676 카운트=3.010 liftSR=0.691
+   sigma=0.10 n=11689 카운트=2.888 liftSR=0.584
+   sigma=0.20 n=11173 카운트=2.687 liftSR=0.364
+
+== G-A 라벨 재현성 ==
+   sigma_label = 0.626  (기준 <= 1.0)   PASS
+   ICC(사전등록 2회 corr(A,B)) = 0.554  (기준 >= 0.5)   PASS
+   ICC(1,1) 3회 ANOVA = 0.555 | 3회 평균 라벨 신뢰도 = 0.789 | 예측 상한 rho <= 0.745
+   [2차 라벨: 첫 window 단독] sigma=1.613  corr(A,B)=0.165
+   >>> G-A 통과
+
+== G-B 예측 == train 28118 / val 7050 / holdout 11257 (물체 [3, 7, 11, 15, 19, 23, 27, 31])
+  B0   val_mse=0.4355  holdout rho=0.071
+  V1   val_mse=0.6156  holdout rho=0.184
+  V2   val_mse=0.4638  holdout rho=0.430
+  V3   val_mse=0.4857  holdout rho=0.457
+  V4   val_mse=0.5932  holdout rho=0.252
+   G-B1 rho(V2) = 0.430  (>= 0.40)          PASS
+   G-B2 V2-V1   = 0.246  (>= 0.10)          PASS
+   G-B3 V2-B0   = 0.359  (>= 0.10)          PASS
+   (최고 변형 = V3, rho=0.457 | rho/sqrt(ICC) = 0.614)
+   >>> G-B 통과
+
+   방향별 hold @303mN (B 측정):     +x     -x     +y     -y     +z     -z
+   teacher  0.979  0.161  0.570  0.502  0.406  0.376   합=2.995
+   rand     0.968  0.140  0.533  0.425  0.368  0.370   합=2.805
+   critic   0.974  0.132  0.577  0.458  0.336  0.421   합=2.899
+   oracle   0.978  0.148  0.583  0.480  0.400  0.397   합=2.985
+   critic 이 고른 후보의 sigma 분포: 0.00:16% 0.05:41% 0.10:25% 0.20:18%
+
+== G-C 선택 == 홀드아웃 장면 1438개 (장면당 후보 7)
+   teacher  카운트 = 2.997
+   rand     카운트 = 2.805
+   critic   카운트 = 2.899
+   oracle   카운트 = 2.985
+   G-C1 critic-random = +0.093  95%CI [+0.061, +0.126]  (>= +0.15 & CI>0)   FAIL
+   G-C2 liftSR critic 0.507 vs random 0.468 (>= -0.05)                    PASS
+   G-C3 선택 효율 eta = 0.519  (오라클A->B 갭 +0.180 중)
+
+>>> 종합: G-A 통과 · G-B 통과 · G-C 불통과

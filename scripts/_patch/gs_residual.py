@@ -24,7 +24,8 @@ import os
 
 _MODE = os.environ.get("GS_RESIDUAL", "")           # "" = 무동작
 _ON = _MODE in ("min", "sum", "zero", "plan_min", "plan_sum",
-                "bmin", "bsum", "plan_bmin", "plan_bsum", "sweep", "oracle", "replay")
+                "bmin", "bsum", "plan_bmin", "plan_bsum", "sweep", "oracle", "replay",
+                "dataset")
 _SWEEP = os.environ.get("GS_RES_SWEEP", "hand")     # hand | posz | posx — 무엇을 쓸어볼지
 _ALLPH = os.environ.get("GS_RES_ALLPHASE", "") not in ("", "0")   # grip 게이팅 해제(접근부터 적용)
 _BIN = (_MODE.split("_")[-1].startswith("b")
@@ -210,6 +211,109 @@ def _run(ppo_self):
         print("[res] === REPLAY 결과: liftSR=%.4f  hold/dir %s  평균 %.4f ==="
               % (float(np.mean(SC)), " ".join("%s=%.3f" % (d, v) for d, v in
                  zip(["+x", "-x", "+y", "-y", "+z", "-z"], h)), float(h.mean())), flush=True)
+        raise SystemExit(0)
+
+    if _MODE == "dataset":
+        # ★ critic 컨셉 검증용 라벨 생성 — 설계 = docs/EXP_CRITIC.md
+        #   장면마다 R 개 후보(12-D plan)를 **같은 장면에서** 굴리고 6방향 버팀 카운트(0~6)를 라벨로 덤프.
+        #   ★ 같은 (장면·후보)를 2회 독립 측정(A/B). A = 재현성·특징·선택, B = 편향 없는 평가
+        #     (RESULTS_RESIDUAL §10: best-of-N 보고값은 상한이 아니다 — 선택과 평가를 분리한다).
+        from isaacgym.torch_utils import quat_apply, quat_conjugate
+        import time as _time
+        n_obj = env._br_n_obj
+        R = n // n_obj
+        dp = 6 + env.num_active_hand_dofs
+        allenv = torch.arange(env.num_envs, device=dev)
+        EPS = int(os.environ.get("GS_DS_EPS", "40") or 40)
+        NPTS = int(os.environ.get("GS_DS_NPTS", "256") or 256)
+        SIGS = [float(x) for x in os.environ.get("GS_DS_SIGS", "0.05,0.10,0.20").split(",") if x.strip()]
+        NREP = int(os.environ.get("GS_DS_REPS", "3") or 3)          # 같은 (장면·후보) 독립 반복 측정 수
+        slot = (torch.arange(n, device=dev) // n_obj)                 # 후보 슬롯 0..R-1
+        sig_of = torch.tensor([0.0] + [SIGS[(i - 1) % len(SIGS)] for i in range(1, R)],
+                              dtype=torch.float, device=dev)          # 슬롯 0 = teacher 원본
+        ST = {k: [] for k in ("obs", "pcl", "plan", "obj", "slot", "sig", "scene")}
+        LB = [{k: [] for k in ("cnt", "dir", "cnt1", "dir1", "succ", "nwin")} for _ in range(NREP)]
+        print("[res] DATASET  n_obj=%d R=%d eps=%d dp=%d npts=%d sigs=%s reps=%d din=%d"
+              % (n_obj, R, EPS, dp, NPTS, SIGS, NREP, din), flush=True)
+        t0 = _time.time()
+        for ep in range(EPS):
+            # ── 장면: 자유 reset 으로 자세를 뽑아 물체별 하나를 그룹 전체에 뿌린다 (후보 간 장면 동일)
+            env.reset_idx(allenv)
+            p0 = env.root_state_tensor[env.object_indices, 0:7].clone()
+            p0 = p0[:n_obj].repeat(int(np.ceil(env.num_envs / n_obj)), 1)[:env.num_envs]
+            p0np = p0.cpu().numpy()
+            cur = env.reset_idx(allenv, object_init_pose=p0np)["obs"]
+            with torch.no_grad():
+                teach = ppo_self.actor_critic(cur, env.get_state(), inference=True)[:, :dp].clone()
+            base = teach[:n_obj].repeat(R, 1)
+            cand = (base + sig_of[slot].unsqueeze(-1) * torch.randn(n, dp, device=dev)).clamp(-1, 1)
+            cand[:n_obj] = teach[:n_obj]                               # 슬롯 0 = teacher 그대로
+            for rep in range(NREP):
+                env.reset_idx(allenv, object_init_pose=p0np)
+                plan = torch.zeros(env.num_envs, dp, device=dev)
+                plan[:n] = cand
+                env.generate_reaching_plan_idx(allenv, actions=plan[env._br_src])
+                c_acc = torch.zeros(n, device=dev); d_acc = torch.zeros(6, n, device=dev)
+                nw = torch.zeros(n, device=dev)
+                c1 = torch.zeros(n, device=dev); d1 = torch.zeros(6, n, device=dev)
+                got1 = torch.zeros(n, dtype=torch.bool, device=dev)
+                fo = torch.zeros(n, din, device=dev)
+                fp = torch.zeros(n, NPTS, 3, device=dev)
+                gotf = torch.zeros(n, dtype=torch.bool, device=dev)
+                for t in range(T):
+                    env.step(env.compute_reference_actions())
+                    gm = env._br_grip_mask()[:n]
+                    newf = gm & (~gotf)
+                    if rep == 0 and bool(newf.any()):
+                        # ★ "접근 후" 상태 = grip 진입 첫 스텝. 여기서 본 것만 critic 입력이 된다.
+                        fo[newf] = priv_obs(env)[newf]
+                        if hasattr(env, "transformed_pcl"):
+                            pc = env.transformed_pcl[:n]
+                            st = max(1, pc.shape[1] // NPTS)
+                            pc = pc[:, ::st][:, :NPTS]
+                            k = pc.shape[1]
+                            q = quat_conjugate(env.palm_rot[:n]).unsqueeze(1).expand(-1, k, -1)
+                            pcp = quat_apply(q.reshape(-1, 4),
+                                             (pc - env.palm_pos[:n].unsqueeze(1)).reshape(-1, 3)).reshape(n, k, 3)
+                            fp[newf, :k] = pcp[newf]
+                        gotf |= newf
+                    if getattr(env, "_br_active_win", False) and env._br_win == 0:
+                        p_ = env.root_state_tensor[env.object_indices, 0:3]
+                        dd = torch.stack([torch.norm(p_[g2 * n:(g2 + 1) * n] - p_[:n], dim=-1)
+                                          for g2 in range(2, G)], 0)
+                        _, per = _reward(dd, torch)
+                        g_ = gm.float()
+                        c_acc += per.sum(0) * g_; d_acc += per * g_; nw += g_
+                        nf = gm & (~got1)
+                        if bool(nf.any()):
+                            c1[nf] = per.sum(0)[nf]; d1[:, nf] = per[:, nf]; got1 |= nf
+                den = nw.clamp(min=1)
+                LB[rep]["cnt"].append((c_acc / den).cpu().numpy())
+                LB[rep]["dir"].append((d_acc / den).cpu().numpy().T)
+                LB[rep]["cnt1"].append(c1.cpu().numpy())
+                LB[rep]["dir1"].append(d1.cpu().numpy().T)
+                LB[rep]["succ"].append((env.successes[:n] > 0.5).float().cpu().numpy())
+                LB[rep]["nwin"].append(nw.cpu().numpy())
+                if rep == 0:
+                    ST["obs"].append(fo.cpu().numpy())
+                    ST["pcl"].append(fp.cpu().numpy().astype(np.float16))
+                    ST["plan"].append(cand.cpu().numpy())
+                    ST["obj"].append(env._br_obj[:n].cpu().numpy().astype(np.int32))
+                    ST["slot"].append(slot.cpu().numpy().astype(np.int32))
+                    ST["sig"].append(sig_of[slot].cpu().numpy())
+                    ST["scene"].append(np.full(n, ep, dtype=np.int32))
+            el = _time.time() - t0
+            print("[res] ep %3d/%d  cntA=%.3f cntB=%.3f  liftSR=%.3f  win=%.1f  %.0fs (%.1fs/ep, ETA %.0fm)"
+                  % (ep + 1, EPS, float(np.mean(LB[0]["cnt"][-1])), float(np.mean(LB[1]["cnt"][-1])),
+                     float(np.mean(LB[0]["succ"][-1])), float(np.mean(LB[0]["nwin"][-1])),
+                     el, el / (ep + 1), (EPS - ep - 1) * el / (ep + 1) / 60.0), flush=True)
+            if (ep + 1) % 5 == 0 or ep == EPS - 1:
+                d = {k: np.concatenate(v, 0) for k, v in ST.items()}
+                for r in range(NREP):
+                    for k, v in LB[r].items():
+                        d["%s_%s" % (k, "ABCDE"[r])] = np.concatenate(v, 0)
+                np.savez_compressed(os.path.join(out, "data.npz"), **d)
+        print("[res] saved", os.path.join(out, "data.npz"), flush=True)
         raise SystemExit(0)
 
     if _MODE == "oracle":
