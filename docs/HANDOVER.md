@@ -22,6 +22,12 @@ cd $VITAC_ROOT/projects/graspstress && source scripts/_common.sh && gs_check
 셋 다 teacher 를 넘지 못했고, **실패 원인이 매번 다르게 특정됐다** ([`METHOD.md`](METHOD.md) §2).
 현재 위치는 **지각 기반 제어 라인의 S1 직전** — critic 을 목적함수로 계획을 직접 최적화하는 단계.
 
+★ **2026-09-30 새벽 추가 — DIRPRED (7시간 자율 실험, 사용자 아이디어 "방향별 응답 + 신뢰도를 점군·촉각으로")**
+= [`EXP_DIRPRED.md`](EXP_DIRPRED.md) / [`RESULTS_DIRPRED.md`](RESULTS_DIRPRED.md). 결론 네 줄:
+**방향별 응답은 점군만으로 예측된다**(3손 홀드아웃 AUC .75~.87, A1 4/4) · **촉각은 거의 안 더한다**(B1 4/4 ❌, 최대 +.03/가림 +.06) ·
+**앙상블 분산은 신뢰도가 아니다**(A2·A3 4/4 ❌) · **손을 넘지 않는다**(교차 AUC .55, 탐색적).
+촉각이 살아 있는 데이터셋(Shadow/Allegro/Inspire-cc, K=5 포착)이 생겼다 → §3.
+
 ## 2. 지금 당장 할 일
 
 **S1** ([`METHOD.md`](METHOD.md) §4). 새 시뮬레이션 없이 기존 46,425 샘플로 시작할 수 있고,
@@ -30,6 +36,8 @@ GPU 는 검증 재생에만 쓴다. 착수 전에 `docs/EXP_S1.md` 로 **사전�
 - 기준선 teacher **2.997** · 상한 고정 장면 오라클 **3.71** (같은 라벨, 교차검증됨)
 - lift 예측기 동시 학습 → `카운트 s.t. lift ≥ τ` 제약 최적화
 - ★ **독립 재생 검증 필수** — critic 위에서만 좋은 해를 거른다
+- (DIRPRED 이후) S1 의 목적함수를 스칼라 카운트가 아니라 **6-dim 방향별 예측의 최솟값(ε)** 으로 쓸 수 있다 — `52_dirpred.py` 의 P 모델.
+  단 손 입력이 없으면 손을 못 넘고, 불확실성은 축별로 정의해야 한다 (RESULTS_DIRPRED §3).
 
 ## 3. 데이터·산출물 (재생성 없이 쓸 수 있는 것)
 
@@ -39,6 +47,8 @@ GPU 는 검증 재생에만 쓴다. 착수 전에 `docs/EXP_S1.md` 로 **사전�
 | 그 안의 내용 | 특권 55-d · palm PCL 256점 · 12-D 계획 · 6방향 hold ×3 · lift · 물체/장면/σ id | — |
 | 판정 결과 | `results/critic_concept.{md,json}` · `results/critic_run__kimm.txt` | — |
 | 선행 오라클 해 | `runs/residual/oracle_s4{2,3}/oracle.npz` | 물체별 12-D + 고정 자세 |
+| ★ **촉각 살린 라벨 데이터셋** (`GS_CC=1`, K=5 지연 포착 `obsK/pclK/capK`) | `runs/critic/dp_{shadow,allegro}_s42/`, `dp_inspire_cc_s4{2,3}/data.npz` | Shadow 15,840 · Allegro 15,840(유효 9,699) · Inspire 23,760 후보, 각 ×3회 |
+| DIRPRED 판정·예측값 | `results/dirpred_*.json` · `runs/critic/_dp/pred_*.npz` | 셀 4 × 포착 2 |
 
 ★ `runs/` 는 gitignore = 레포 밖 취급. **다른 머신으로 옮기려면 별도 복사**해야 한다.
 
