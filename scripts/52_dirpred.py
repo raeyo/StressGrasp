@@ -290,7 +290,7 @@ def main():
     for k, v in g.items():
         print("   %s %s %s" % (k, "PASS" if v["pass"] else "FAIL", {kk: (round(vv, 3) if isinstance(vv, float) else vv) for kk, vv in v.items() if kk != "pass"}))
     os.makedirs("results", exist_ok=True)
-    json.dump(res, open("results/dirpred_%s_%s.json" % (a.tag, a.feat), "w"), indent=1)
+    json.dump(res, open("results/dirpred_%s_%s__kimm.json" % (a.tag, a.feat), "w"), indent=1)
     # 예측값 저장 (탐색적 분석용 — 게이트 판정에는 쓰지 않는다). 홀드아웃만.
     os.makedirs("runs/critic/_dp", exist_ok=True)
     np.savez_compressed("runs/critic/_dp/pred_%s_%s.npz" % (a.tag, a.feat), Y=Y[te], obj=objs[te], scene=d["scene"][te],
