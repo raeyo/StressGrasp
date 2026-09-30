@@ -17,6 +17,7 @@ HOLD = lambda o: (o % 4) == 3
 ap = argparse.ArgumentParser()
 ap.add_argument("--tag", required=True); ap.add_argument("--hand", required=True)
 ap.add_argument("--data", required=True); ap.add_argument("--tagws", default="kimm")
+ap.add_argument("--world", action="store_true", help="EXP_WORLDLOAD: 라벨이 바뀌므로 슬롯0 R_all_pose 임계를 걸지 않는다 (§2 W0)")
 a = ap.parse_args()
 d = np.load(a.data, allow_pickle=True)
 names = [str(x) for x in d["meta_armnames"]]
@@ -42,7 +43,7 @@ p0 = dict(allpose_slot0=float(((apA + apB) / 2)[z].mean()), g0_slot0=float(((g0A
           done6=float(doneA6.mean()), ctrl_hold=float(d["ctrl_hold_A"][g0A > 0].mean()),
           on_frac=float(d["on_frac_A"].mean()), n_units=int(len(units)))
 ref = REF[a.hand]
-p0["pass"] = bool(abs(p0["allpose_slot0"] - ref["allpose"]) <= P0_TOL
+p0["pass"] = bool((a.world or abs(p0["allpose_slot0"] - ref["allpose"]) <= P0_TOL)
                   and abs(p0["g0_slot0"] - ref["g0"]) <= P0_TOL
                   and p0["ctrl_hold"] >= 0.95 and p0["done6"] >= 0.30)
 print("== P0 계측기 (%s) ==" % a.hand)
@@ -122,6 +123,11 @@ print("\n>>> P1 (가동범위) = **%s**   최선 셀 %s  Δ*=%+.3f CI[%+.3f,%+.3
 print(">>> P2 (손목 회전이 원인?) = %s   max(ROT,NEW) %+.3f − max(OLD) %+.3f = %+.3f (>= %+.2f)"
       % ("PASS" if p2 else "FAIL", gnew, gold, gnew - gold, G_P2))
 print(">>> P3 (클램프 사다리별 이득) = %s" % p3)
+rotg = [res["cells"]["ROT_L%d" % (i + 1)]["gain"] for i in range(NLEV)]
+w1 = max(rotg) - min(rotg)
+res["W1"] = dict(**{"pass": bool(w1 >= 0.15)}, rot_gains=rotg, span=w1)
+print(">>> W1 (ROT 레벨 간 이득 범위, 대칭 해소) = %.3f  (>= 0.15 면 손목 방향이 실제 축) %s"
+      % (w1, "PASS" if w1 >= 0.15 else "FAIL"))
 os.makedirs("results", exist_ok=True)
 fn = "results/postres_%s__%s.json" % (a.tag, a.tagws)
 json.dump(res, open(fn, "w"), indent=1, default=float)
