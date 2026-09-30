@@ -48,7 +48,7 @@ GPU 는 검증 재생에만 쓴다. 착수 전에 `docs/EXP_S1.md` 로 **사전�
 | 판정 결과 | `results/critic_concept.{md,json}` · `results/critic_run__kimm.txt` | — |
 | 선행 오라클 해 | `runs/residual/oracle_s4{2,3}/oracle.npz` | 물체별 12-D + 고정 자세 |
 | ★ **촉각 살린 라벨 데이터셋** (`GS_CC=1`, K=5 지연 포착 `obsK/pclK/capK`) | `runs/critic/dp_{shadow,allegro}_s42/`, `dp_inspire_cc_s4{2,3}/data.npz` | Shadow 15,840 · Allegro 15,840(유효 9,699) · Inspire 23,760 후보, 각 ×3회 |
-| DIRPRED 판정·예측값 | `results/dirpred_*.json` · `runs/critic/_dp/pred_*.npz` | 셀 4 × 포착 2 |
+| DIRPRED 판정·예측값 | `results/dirpred_*__kimm.json` · `runs/critic/_dp/pred_*.npz` | 셀 4 × 포착 2 |
 
 ★ `runs/` 는 gitignore = 레포 밖 취급. **다른 머신으로 옮기려면 별도 복사**해야 한다.
 

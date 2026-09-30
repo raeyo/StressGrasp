@@ -1,6 +1,6 @@
 # RESULTS — 방향별 외력 응답 예측기 (DIRPRED) · 판독 (2026-09-30 완료)
 
-> 사전등록 = [`EXP_DIRPRED.md`](EXP_DIRPRED.md) (임계값은 수치 보기 전 고정) · 수치 = `../results/dirpred_*.json`
+> 사전등록 = [`EXP_DIRPRED.md`](EXP_DIRPRED.md) (임계값은 수치 보기 전 고정) · 수치 = `../results/dirpred_*__kimm.json`
 > 원시 = `runs/critic/dp_*/data.npz` · 예측값 = `runs/critic/_dp/pred_*.npz` (레포 밖)
 > 선행 = [`RESULTS_CRITIC.md`](RESULTS_CRITIC.md) (스칼라 critic) · [`RESULTS_BRANCH.md`](RESULTS_BRANCH.md)
 
@@ -193,7 +193,7 @@ Part A(같은 손, 첫 스텝, 촉각 0)의 P .828 → Inspire-cc(K 포착) P .8
 손을 바꾸면 같은 점군이 다른 접촉을 만든다. **손 무관 예측기가 되려면 손(손가락 위치·관절)을 입력에 넣어야 한다** —
 선행 critic 의 "55-d 특권은 무용" 결론과 모순되지 않는다: 그때는 형상이 없었고, 지금은 손이 없다. 둘 다 있어야 한다는 뜻.
 
-### 2-5. 탐색적 — 손 상태를 입력에 더하면 (사전등록 외, `52_dirpred.py` 변형 PH/PHT/H, `results/dirpred_*_hand_K.json`)
+### 2-5. 탐색적 — 손 상태를 입력에 더하면 (사전등록 외, `52_dirpred.py` 변형 PH/PHT/H, `results/dirpred_*_hand_K__kimm.json`)
 
 §2-4 가 "손 정보가 없다"고 특정했으므로, 같은 손 안에서 손 상태(정규화 관절 + 손바닥 좌표계 손끝 위치)를 더해 봤다. K 포착, 비퇴화 평균 AUC:
 
@@ -233,3 +233,7 @@ Part A(같은 손, 첫 스텝, 촉각 0)의 P .828 → Inspire-cc(K 포착) P .8
 - "부분 관측"은 **합성 가림**(반공간)이다. 실제 카메라 가림과 다르다.
 - Allegro 의 낮은 AUC(.75)가 손 때문인지 표본(6k) 때문인지 — 분리 안 됨.
 - seed 는 Inspire-cc 만 2개. Shadow/Allegro 는 seed 42 하나.
+
+---
+_워크스페이스 = kimm-h200 (`kimm`). 기준 커밋 = 사전등록 `EXP_DIRPRED.md` 는 hub 커밋 이전에 kimm 에서 작성됐다 (CLAUDE.md 규칙 도입 전 세션).
+결과 파일 `results/dirpred_*__kimm.json`. 하네스 `scripts/_patch/gs_residual.py` 수정(dataset 모드 K 지연 포착)은 배정 없이 이뤄졌다 — hub 검토 요청._
