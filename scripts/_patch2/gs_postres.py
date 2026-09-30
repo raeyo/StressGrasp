@@ -19,6 +19,8 @@
 import os
 
 _ON = os.environ.get("GS_POSTRES", "") not in ("", "0")
+_MODE = os.environ.get("GS_PR_MODE", "sweep")          # sweep(가동범위) | abort(중단·재계획 데이터)
+_WORLD = os.environ.get("GS_PR_WORLD", "") not in ("", "0")   # 외력 방향을 세계 고정으로 (EXP_WORLDLOAD)
 _EPS = int(os.environ.get("GS_PR_EPS", "20") or 20)
 _K = int(os.environ.get("GS_PR_K", "4") or 4)
 _KCAP = int(os.environ.get("GS_PR_KCAP", "5") or 5)
@@ -53,14 +55,33 @@ def _run(ppo_self):
     out = _OUT or os.path.join(os.environ.get("GS_ROOT", "."), "runs", "postres", "pr")
     os.makedirs(out, exist_ok=True)
     allenv = torch.arange(env.num_envs, device=dev)
+
+    if _WORLD:
+        # ★ EXP_WORLDLOAD: 외력 방향을 t0 palm 고정 대신 **세계축 고정**으로. 공유 하니스는 안 고친다 —
+        #   인스턴스 메서드로 감싸 원본 호출 뒤 매 스텝 되돌린다 (_br_apply 는 그 다음 substep 에서 읽는다).
+        import types as _types
+        _orig_ph = env._br_ph_step
+
+        def _ph_world(self):
+            r = _orig_ph()
+            self._ph_dirw = self._br_dirvec
+            return r
+        env._br_ph_step = _types.MethodType(_ph_world, env)
+        print("[pr] ★ WORLD-FIXED 하중 (palm 대칭 해소, EXP_WORLDLOAD)", flush=True)
+
     ar = torch.arange(n, device=dev)
     slot = (ar // n_obj)                                   # [n] 0..R-1
     probe_idx = torch.stack([(2 + d) * n + ar for d in range(6)], 0)   # [6, n]
     ctrl_idx = n + ar
 
+    if _MODE == "abort":
+        return _run_abort(ppo_self, env, dev, n, n_obj, R, G, src, T, nh, dp, out, allenv, ar,
+                          slot, probe_idx, ctrl_idx, np, torch)
+
     # ---- 슬롯 -> (팔, 레벨) 배정
     n_need = 1 + len(_ARMS) * _NLEV * _K
-    assert R >= n_need, "R(%d) < 필요 슬롯(%d). GS_REPL 을 %d 로." % (R, n_need, n_need)
+    if _MODE == "sweep":
+        assert R >= n_need, "R(%d) < 필요 슬롯(%d). GS_REPL 을 %d 로." % (R, n_need, n_need)
     arm_of = np.zeros(R, dtype=np.int32)                   # 0 = ZERO
     lev_of = np.zeros(R, dtype=np.int32)
     s = 1
@@ -199,6 +220,122 @@ def _run(ppo_self):
                 d["%s_%s" % (k, "ABCDE"[r])] = np.concatenate(v, 0)
         np.savez_compressed(os.path.join(out, "data.npz"), **d)
 
+    print("[pr] saved", os.path.join(out, "data.npz"), flush=True)
+    raise SystemExit(0)
+
+
+def _run_abort(ppo_self, env, dev, n, n_obj, R, G, src, T, nh, dp, out, allenv, ar,
+               slot, probe_idx, ctrl_idx, np, torch):
+    """EXP_ABORT — R개 후보 계획 × A/B 2회. 특징을 **두 시점**(C=폐합+K 들기 전, L=t0 들기 후)에서 뜬다."""
+    import time as _time
+    import gs_residual                                   # 공유 하니스 재사용 (수정 없음)
+    from isaacgym.torch_utils import quat_apply, quat_conjugate
+    priv_obs = gs_residual._build()[0]
+    NPTS = int(os.environ.get("GS_PR_NPTS", "256") or 256)
+    SIGS = [float(x) for x in os.environ.get("GS_PR_SIGS", "0.05,0.10,0.20").split(",") if x.strip()]
+    din = priv_obs(env).shape[-1]
+    sig_of = torch.tensor([0.0] + [SIGS[(i - 1) % len(SIGS)] for i in range(1, R)], dtype=torch.float, device=dev)
+    print("[pr] ABORT n_obj=%d R=%d n_env=%d eps=%d reps=%d din=%d npts=%d kcap=%d sigs=%s"
+          % (n_obj, R, env.num_envs, _EPS, _REPS, din, NPTS, _KCAP, SIGS), flush=True)
+
+    def _sub(pc):
+        st = max(1, pc.shape[1] // NPTS)
+        return pc[:, ::st][:, :NPTS]
+
+    def _snap(mask, fo, fp):
+        fo[mask] = priv_obs(env)[mask]
+        if hasattr(env, "transformed_pcl"):
+            pc = _sub(env.transformed_pcl[:n]); k = pc.shape[1]
+            q = quat_conjugate(env.palm_rot[:n]).unsqueeze(1).expand(-1, k, -1)
+            pcp = quat_apply(q.reshape(-1, 4), (pc - env.palm_pos[:n].unsqueeze(1)).reshape(-1, 3)).reshape(n, k, 3)
+            fp[mask, :k] = pcp[mask]
+
+    ST = {k: [] for k in ("obsC", "pclC", "capC", "obsL", "pclL", "capL", "plan", "teach",
+                          "obj", "slot", "sig", "scene")}
+    LB = [{k: [] for k in ("g0", "yhold", "ypose", "done", "ctrl_hold", "succ")} for _ in range(_REPS)]
+    P0 = []
+    t_start = _time.time()
+    for ep in range(_EPS):
+        env.reset_idx(allenv)
+        p0 = env.root_state_tensor[env.object_indices, 0:7].clone()
+        p0 = p0[:n_obj].repeat(int(np.ceil(env.num_envs / n_obj)), 1)[:env.num_envs]
+        p0np = p0.cpu().numpy()
+        cur = env.reset_idx(allenv, object_init_pose=p0np)["obs"]
+        with torch.no_grad():
+            teach = ppo_self.actor_critic(cur, env.get_state(), inference=True)[:, :dp].clone()
+        base = teach[:n_obj].repeat(R, 1)
+        cand = (base + sig_of[slot].unsqueeze(-1) * torch.randn(n, dp, device=dev)).clamp(-1, 1)
+        cand[:n_obj] = teach[:n_obj]                     # 슬롯0 = teacher
+
+        for rep in range(_REPS):
+            env.reset_idx(allenv, object_init_pose=p0np)
+            plan = torch.zeros(env.num_envs, dp, device=dev)
+            plan[:n] = cand
+            env.generate_reaching_plan_idx(allenv, actions=plan[src])
+            N_ = env.num_envs
+            t_grip = torch.full((n,), -1, dtype=torch.long, device=dev)
+            g0 = torch.zeros(n, dtype=torch.bool, device=dev)
+            mydone = torch.zeros(N_, dtype=torch.bool, device=dev)
+            nan = float("nan")
+            ep_end = torch.full((N_,), nan, device=dev); dz_end = torch.full((N_,), nan, device=dev)
+            ep_max = torch.full((N_,), nan, device=dev); eR_max = torch.full((N_,), nan, device=dev)
+            if rep == 0:
+                foC = torch.zeros(n, din, device=dev); fpC = torch.zeros(n, NPTS, 3, device=dev)
+                foL = torch.zeros(n, din, device=dev); fpL = torch.zeros(n, NPTS, 3, device=dev)
+                gotC = torch.zeros(n, dtype=torch.bool, device=dev)
+                gotL = torch.zeros(n, dtype=torch.bool, device=dev)
+            for t in range(T):
+                env.step(env.compute_reference_actions())
+                if rep == 0:
+                    grip = env._br_grip_mask()[:n]
+                    tt = env.progress_buf[:n].long()
+                    t_grip = torch.where(grip & (t_grip < 0), tt, t_grip)
+                    newC = (t_grip >= 0) & ((tt - t_grip) >= _KCAP) & (~gotC)
+                    if bool(newC.any()):
+                        _snap(newC, foC, fpC); gotC |= newC
+                    newL = (env._ph_t0m >= 0) & (~gotL)
+                    if bool(newL.any()):
+                        _snap(newL, foL, fpL); gotL |= newL
+                g0 |= env._ph_g0[:n]
+                nd = env._ph_done & (~mydone)
+                if bool(nd.any()):
+                    ep_end[nd] = env._ph_ep_end[nd]; dz_end[nd] = env._ph_dz_end[nd]
+                    ep_max[nd] = env._ph_ep_max[nd]; eR_max[nd] = env._ph_eR_max[nd]
+                    mydone |= nd
+            yh = mydone & (ep_end <= _EP_END_MAX) & (dz_end > _DZ_END_MIN)
+            yp = yh & (ep_max <= _EP_MAX_MAX) & (eR_max <= float(np.deg2rad(_ER_MAX_DEG)))
+            L = LB[rep]
+            L["g0"].append(g0.float().cpu().numpy())
+            L["yhold"].append(yh[probe_idx].float().T.cpu().numpy())
+            L["ypose"].append(yp[probe_idx].float().T.cpu().numpy())
+            L["done"].append(mydone[probe_idx].float().T.cpu().numpy())
+            L["ctrl_hold"].append(yh[ctrl_idx].float().cpu().numpy())
+            L["succ"].append((env.successes[:n] > 0.5).float().cpu().numpy())
+        ST["obsC"].append(foC.cpu().numpy()); ST["pclC"].append(fpC.cpu().numpy().astype(np.float16))
+        ST["capC"].append(gotC.cpu().numpy().astype(np.int32))
+        ST["obsL"].append(foL.cpu().numpy()); ST["pclL"].append(fpL.cpu().numpy().astype(np.float16))
+        ST["capL"].append(gotL.cpu().numpy().astype(np.int32))
+        ST["plan"].append(cand.cpu().numpy()); ST["teach"].append(base.cpu().numpy())
+        ST["obj"].append(env._br_obj[:n].cpu().numpy().astype(np.int32))
+        ST["slot"].append(slot.cpu().numpy().astype(np.int32))
+        ST["sig"].append(sig_of[slot].cpu().numpy())
+        ST["scene"].append(np.full(n, ep, dtype=np.int32))
+        P0.append(p0np[:n_obj].copy())
+        el = _time.time() - t_start
+        a0 = LB[0]; d_ = a0["done"][-1] > 0
+        apv = (a0["g0"][-1] > 0) & d_.all(1) & (a0["ypose"][-1] > 0.5).all(1)
+        z = slot.cpu().numpy() == 0
+        print("[pr] ep %3d/%d  g0=%.3f capC=%.3f capL=%.3f ctrlHold=%.3f | R_all_pose: 슬롯0 %.3f / 전체 %.3f | %.0fs (%.1fs/ep, ETA %.0fm)"
+              % (ep + 1, _EPS, float(a0["g0"][-1].mean()), float(gotC.float().mean()), float(gotL.float().mean()),
+                 float(np.nanmean(a0["ctrl_hold"][-1][a0["g0"][-1] > 0])) if (a0["g0"][-1] > 0).any() else float("nan"),
+                 float(apv[z].mean()), float(apv.mean()), el, el / (ep + 1), (_EPS - ep - 1) * el / (ep + 1) / 60.0), flush=True)
+        d = {k: np.concatenate(v, 0) for k, v in ST.items()}
+        d.update(p0_obj=np.stack(P0, 0), meta_R=R, meta_nobj=n_obj, meta_kcap=_KCAP, meta_din=din,
+                 meta_alpha=float(os.environ.get("GS_BR_ALPHA", "8")))
+        for r in range(_REPS):
+            for k, v in LB[r].items():
+                d["%s_%s" % (k, "ABCDE"[r])] = np.concatenate(v, 0)
+        np.savez_compressed(os.path.join(out, "data.npz"), **d)
     print("[pr] saved", os.path.join(out, "data.npz"), flush=True)
     raise SystemExit(0)
 
