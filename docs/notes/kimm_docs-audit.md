@@ -66,10 +66,29 @@ wrench 백본 비판 7건 → `IDEAS.md` §3 · 사다리 T1~T6 → `EXPERIMENTS
 | 11 | 시점 3분할 표가 `FAILURE_MAP` §1 과 `BASELINE_FITNESS` §5 에 **중복** | `FACTS.md` A6 하나로 |
 | 12 | `METHOD.md`(`kimm/critic`) 는 **A(형성)** 를 겨냥 vs 결정 1 은 문제를 **B** 로 정의 | **미해소.** `METHOD.md` §0 에 셋(i/ii/iii)으로 열어 두었다 → **A→B 인과 측정이 선결** |
 
+## 3-1. ⚠ 작업 중에 다른 세션이 움직였다 (2026-09-30 03:00~03:30)
+
+공유 작업 디렉토리(`projects/graspstress`)에서 **다른 kimm 세션이 동시에 작업 중**이었다. 관측:
+- 그 디렉토리의 브랜치가 `master` → **`kimm/dirpred`** 로 바뀌었다
+- 커밋 `2d1decc`(문서 재편 반영)이 **이 통합 작업의 중간 산출물(신설 문서 7개)을 자기 커밋에 포함**시켰다
+- **새 실험 DIRPRED**(7시간 자율, `docs/{EXP,RESULTS}_DIRPRED.md` · `scripts/52~54_*`)가 추가됐다
+- `scripts/50_dataset.sh`·`_patch/gs_residual.py` 가 수정됐다 (K 지연 포착) — **하니스 소유 배정 없이**
+
+→ **이 브랜치는 `origin/master` 기준이므로 DIRPRED 문서를 담지 않는다.**
+E12 의 결과는 `FACTS.md` **§E**, `EXPERIMENTS.md` **E12**, `QUESTIONS.md` **Q6·Q9·Q12·Q13**,
+`IDEAS.md` **I-15·I-32~I-34**, `PITFALLS.md` **P9·P21·P22**, `METHOD.md` §0 에 **브랜치를 명시해** 반영했다.
+
 ## 4. hub 에 확인을 요청하는 것
 
 1. **정본 문서 4건**(`PROBLEM.md`·`PROTOCOL.md`·`README.md` 수정, `EXP_*`/`RESULTS_*` 삭제) — 확정 권한이 hub 다.
 2. **상충 #12** — 방법을 A 로 유지할지 B/C 로 옮길지. `METHOD.md` §0 이 선택지만 정리했다.
 3. **상충 #2** — 형성 단계 Shadow·Allegro **재측정 배정** (규약 지켜 3손, Q4·Q5 를 한 런으로).
-4. **`kimm/critic` merge 여부** — `FACTS.md` §B·§C·§D 의 출처가 그 브랜치다. 미merge 상태를 문서에 명시해 두었다.
-5. **`CLAIMS.md` 갱신** — 이 브랜치(`kimm/docs`)를 "리뷰 요청"으로 등록.
+4. **`kimm/critic` merge 여부** — `FACTS.md` §B·§C·§D 의 출처. 미merge 상태를 문서에 명시해 두었다.
+5. ★ **`kimm/dirpred` merge 여부** — `FACTS.md` §E 의 출처이고, **하니스 수정이 배정 없이** 이뤄졌다.
+   merge 순서에 따라 이 브랜치와 `docs/` 충돌이 생긴다 (그쪽 커밋 `2d1decc` 가 같은 신설 문서를 담고 있다).
+   ★ **권장 순서: `kimm/critic` → `kimm/dirpred` → `kimm/docs`** (문서 통합을 마지막에).
+6. **`CLAIMS.md` 갱신** — 이 브랜치(`kimm/docs`)를 "리뷰 요청"으로 등록. 그리고 **공유 디렉토리에
+   두 kimm 세션이 동시에 있었던 것**을 §3-1 기준으로 정리.
+7. ★ **E12 가 방법 선택에 주는 것** — 3고리 중 ②(예측)가 확정됐다. 후보 생성 라인의 안내자를
+   스칼라 critic(ρ .457) → **6-dim 방향별 예측기**(AUC .75~.88)로 교체할 수 있다 (`IDEAS.md` I-32).
+   ⚠ 단 **예측기가 손을 넘지 못한다**(교차 .55) — universal 주장에는 손 입력(I-33)이 선결.
