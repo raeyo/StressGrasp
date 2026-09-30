@@ -35,6 +35,11 @@ cd $VITAC_ROOT/projects/graspstress && source scripts/_common.sh && gs_check
 **이 프로젝트에서 물리 재생으로 teacher 를 넘은 첫 개입(복제 포함).** 남은 벽 = 형상 일반화(학습 물체 25종).
 새 자산: `runs/critic/hp_*` (posthold 라벨 데이터셋 3손 + test/replay 장면), `runs/critic/_hp/pre_*.pt` (PRE 앙상블), 스크립트 `55~57`.
 
+★★★ **2026-10-01 새벽 — ACTOR (사용자 착상 "critic 출력을 actor 가 유추, end-to-end")** = [`EXP_ACTOR.md`](EXP_ACTOR.md) / [`RESULTS_ACTOR.md`](RESULTS_ACTOR.md).
+비관적 critic 위 amortized actor(`58_actor.py`) + 온라인 반복(actor → 재생 → critic 재학습, `runs/critic/_hp/iterate.sh`) 4라운드.
+**Shadow: 전 물체 +.109 [+.073, +.144] · 보지 않은 물체 +.094 [+.031, +.156] · 들어올리기 +.05~+.14 — 새 형상으로 넘어간 첫 이득.** CEM(+.03 n.s.)보다 낫다.
+Inspire 는 라벨 포화로 반복 이득 없음. **사용자 결정: 이후 PoC 는 Shadow 단일 손** (Allegro 접음). 다음 = 이득 분해(g0 vs 자세 유지) · 반복 연장 · 물체 확대 (RESULTS_ACTOR §4).
+
 ## 2. 지금 당장 할 일
 
 **S1** ([`METHOD.md`](METHOD.md) §4). 새 시뮬레이션 없이 기존 46,425 샘플로 시작할 수 있고,

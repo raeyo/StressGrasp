@@ -57,7 +57,7 @@ def fit_pre(seed, X, P, Y7, M6, tr, va, epochs=80, bs=1024):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True); ap.add_argument("--ens", type=int, default=5)
-    ap.add_argument("--save_pre", default=""); ap.add_argument("paths", nargs="+")
+    ap.add_argument("--save_pre", default=""); ap.add_argument("--pre_only", action="store_true"); ap.add_argument("paths", nargs="+")
     a = ap.parse_args(); t0 = time.time()
     d, _ = m.load(a.paths)
     reps = [r for r in "ABCDE" if ("ypose_" + r) in d]
@@ -103,6 +103,7 @@ def main():
     cf_n = np.linalg.norm(cf.reshape(N0, ncf, 3), axis=-1) / 0.1
     print("   t0 접촉률(valid) = %.3f  힘합 %.1f N" % ((cf_n[valid] > 0.05).any(1).mean(), cf_n[valid].sum(1).mean()))
     VAR = {"P": (None, pcl0), "PH": (handn, pcl0), "PHT": (np.concatenate([handn, cfn], 1), pcl0), "H": (handn, None), "T": (cfn, None)}
+    if a.pre_only: VAR = {"P": (None, pcl0)}
     yt = T(Yp); yht = T(Yh)
     for name, (X, P) in VAR.items():
         Xt = T(X) if X is not None else None; Pt = T(P) if P is not None else None
