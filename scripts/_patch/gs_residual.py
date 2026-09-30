@@ -228,13 +228,29 @@ def _run(ppo_self):
         NPTS = int(os.environ.get("GS_DS_NPTS", "256") or 256)
         SIGS = [float(x) for x in os.environ.get("GS_DS_SIGS", "0.05,0.10,0.20").split(",") if x.strip()]
         NREP = int(os.environ.get("GS_DS_REPS", "3") or 3)          # 같은 (장면·후보) 독립 반복 측정 수
+        KCAP = int(os.environ.get("GS_DS_CAPTURE_K", "5") or 5)     # ★ 2차 포착 = grip 진입 후 K 스텝 (P9: 첫 스텝은 접촉률 25%)
+        n_hand = int(env.num_active_hand_dofs); n_ft = int(env.fingertip_pos.shape[1])
+        n_cf = int(env.contact_force_sensors.shape[1])              # priv_obs 의 cf 슬라이스 = [n_hand+7+3*n_ft : +3*n_cf]
         slot = (torch.arange(n, device=dev) // n_obj)                 # 후보 슬롯 0..R-1
         sig_of = torch.tensor([0.0] + [SIGS[(i - 1) % len(SIGS)] for i in range(1, R)],
                               dtype=torch.float, device=dev)          # 슬롯 0 = teacher 원본
-        ST = {k: [] for k in ("obs", "pcl", "plan", "obj", "slot", "sig", "scene")}
+        ST = {k: [] for k in ("obs", "pcl", "plan", "obj", "slot", "sig", "scene",
+                              "obsK", "pclK", "capK", "ageK")}
         LB = [{k: [] for k in ("cnt", "dir", "cnt1", "dir1", "succ", "nwin")} for _ in range(NREP)]
-        print("[res] DATASET  n_obj=%d R=%d eps=%d dp=%d npts=%d sigs=%s reps=%d din=%d"
-              % (n_obj, R, EPS, dp, NPTS, SIGS, NREP, din), flush=True)
+        print("[res] DATASET  n_obj=%d R=%d eps=%d dp=%d npts=%d sigs=%s reps=%d din=%d  kcap=%d n_hand=%d n_ft=%d n_cf=%d"
+              % (n_obj, R, EPS, dp, NPTS, SIGS, NREP, din, KCAP, n_hand, n_ft, n_cf), flush=True)
+
+        def _snap(mask, fo_, fp_):
+            fo_[mask] = priv_obs(env)[mask]
+            if hasattr(env, "transformed_pcl"):
+                pc = env.transformed_pcl[:n]
+                st = max(1, pc.shape[1] // NPTS)
+                pc = pc[:, ::st][:, :NPTS]
+                k = pc.shape[1]
+                q = quat_conjugate(env.palm_rot[:n]).unsqueeze(1).expand(-1, k, -1)
+                pcp = quat_apply(q.reshape(-1, 4),
+                                 (pc - env.palm_pos[:n].unsqueeze(1)).reshape(-1, 3)).reshape(n, k, 3)
+                fp_[mask, :k] = pcp[mask]
         t0 = _time.time()
         for ep in range(EPS):
             # ── 장면: 자유 reset 으로 자세를 뽑아 물체별 하나를 그룹 전체에 뿌린다 (후보 간 장면 동일)
@@ -260,23 +276,26 @@ def _run(ppo_self):
                 fo = torch.zeros(n, din, device=dev)
                 fp = torch.zeros(n, NPTS, 3, device=dev)
                 gotf = torch.zeros(n, dtype=torch.bool, device=dev)
+                foK = torch.zeros(n, din, device=dev)
+                fpK = torch.zeros(n, NPTS, 3, device=dev)
+                gotK = torch.zeros(n, dtype=torch.bool, device=dev)
+                ageK = torch.zeros(n, device=dev)
                 for t in range(T):
                     env.step(env.compute_reference_actions())
                     gm = env._br_grip_mask()[:n]
                     newf = gm & (~gotf)
                     if rep == 0 and bool(newf.any()):
-                        # ★ "접근 후" 상태 = grip 진입 첫 스텝. 여기서 본 것만 critic 입력이 된다.
-                        fo[newf] = priv_obs(env)[newf]
-                        if hasattr(env, "transformed_pcl"):
-                            pc = env.transformed_pcl[:n]
-                            st = max(1, pc.shape[1] // NPTS)
-                            pc = pc[:, ::st][:, :NPTS]
-                            k = pc.shape[1]
-                            q = quat_conjugate(env.palm_rot[:n]).unsqueeze(1).expand(-1, k, -1)
-                            pcp = quat_apply(q.reshape(-1, 4),
-                                             (pc - env.palm_pos[:n].unsqueeze(1)).reshape(-1, 3)).reshape(n, k, 3)
-                            fp[newf, :k] = pcp[newf]
+                        # ★ 1차 포착 = grip 진입 첫 스텝 (EXP_CRITIC 원안)
+                        _snap(newf, fo, fp)
                         gotf |= newf
+                    if rep == 0:
+                        # ★ 2차 포착 = grip 진입 후 K 스텝 (EXP_DIRPRED §3 — 촉각이 살아 있는 시점)
+                        age = env.progress_buf[:n].long() - env._br_t_grip
+                        newK = gm & (~gotK) & (env._br_t_grip >= 0) & (age >= KCAP)
+                        if bool(newK.any()):
+                            _snap(newK, foK, fpK)
+                            ageK[newK] = age[newK].float()
+                            gotK |= newK
                     if getattr(env, "_br_active_win", False) and env._br_win == 0:
                         p_ = env.root_state_tensor[env.object_indices, 0:3]
                         dd = torch.stack([torch.norm(p_[g2 * n:(g2 + 1) * n] - p_[:n], dim=-1)
@@ -302,6 +321,10 @@ def _run(ppo_self):
                     ST["slot"].append(slot.cpu().numpy().astype(np.int32))
                     ST["sig"].append(sig_of[slot].cpu().numpy())
                     ST["scene"].append(np.full(n, ep, dtype=np.int32))
+                    ST["obsK"].append(foK.cpu().numpy())
+                    ST["pclK"].append(fpK.cpu().numpy().astype(np.float16))
+                    ST["capK"].append(gotK.cpu().numpy().astype(np.int32))
+                    ST["ageK"].append(ageK.cpu().numpy())
             el = _time.time() - t0
             print("[res] ep %3d/%d  cntA=%.3f cntB=%.3f  liftSR=%.3f  win=%.1f  %.0fs (%.1fs/ep, ETA %.0fm)"
                   % (ep + 1, EPS, float(np.mean(LB[0]["cnt"][-1])), float(np.mean(LB[1]["cnt"][-1])),
@@ -309,6 +332,7 @@ def _run(ppo_self):
                      el, el / (ep + 1), (EPS - ep - 1) * el / (ep + 1) / 60.0), flush=True)
             if (ep + 1) % 5 == 0 or ep == EPS - 1:
                 d = {k: np.concatenate(v, 0) for k, v in ST.items()}
+                d.update(meta_nhand=n_hand, meta_nft=n_ft, meta_ncf=n_cf, meta_kcap=KCAP)
                 for r in range(NREP):
                     for k, v in LB[r].items():
                         d["%s_%s" % (k, "ABCDE"[r])] = np.concatenate(v, 0)
