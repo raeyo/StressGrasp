@@ -28,6 +28,13 @@ cd $VITAC_ROOT/projects/graspstress && source scripts/_common.sh && gs_check
 **앙상블 분산은 신뢰도가 아니다**(A2·A3 4/4 ❌) · **손을 넘지 않는다**(교차 AUC .55, 탐색적).
 촉각이 살아 있는 데이터셋(Shadow/Allegro/Inspire-cc, K=5 포착)이 생겼다 → §3.
 
+★★ **2026-09-30 저녁 추가 — HOLDPRED (사용자 "쭉 진행" 지시)** = [`EXP_HOLDPRED.md`](EXP_HOLDPRED.md) / [`RESULTS_HOLDPRED.md`](RESULTS_HOLDPRED.md).
+라벨을 **파지 후 유지 상태**(hub posthold 장치, α=8, Y_pose)로 옮기고, hold 상태 예측기(H1) · 실행 전 예측기(H2) · **CEM 계획 최적화 → 물리 재생(H3)** 까지 갔다.
+결론: 유지 구간은 형성 구간과 다르다 — Inspire 는 점군만으론 안 되고 손 상태 필요, Shadow 는 촉각 단독이 점군만큼 맞힌다.
+**행동 이득**: 보지 않은 물체 ❌(두 손), 그러나 **Inspire 학습 물체·새 장면에서 teacher +.107 → 사전등록 복제 +.098 (CI>0, lift 유지)** —
+**이 프로젝트에서 물리 재생으로 teacher 를 넘은 첫 개입(복제 포함).** 남은 벽 = 형상 일반화(학습 물체 25종).
+새 자산: `runs/critic/hp_*` (posthold 라벨 데이터셋 3손 + test/replay 장면), `runs/critic/_hp/pre_*.pt` (PRE 앙상블), 스크립트 `55~57`.
+
 ## 2. 지금 당장 할 일
 
 **S1** ([`METHOD.md`](METHOD.md) §4). 새 시뮬레이션 없이 기존 46,425 샘플로 시작할 수 있고,
@@ -38,6 +45,9 @@ GPU 는 검증 재생에만 쓴다. 착수 전에 `docs/EXP_S1.md` 로 **사전�
 - ★ **독립 재생 검증 필수** — critic 위에서만 좋은 해를 거른다
 - (DIRPRED 이후) S1 의 목적함수를 스칼라 카운트가 아니라 **6-dim 방향별 예측의 최솟값(ε)** 으로 쓸 수 있다 — `52_dirpred.py` 의 P 모델.
   단 손 입력이 없으면 손을 못 넘고, 불확실성은 축별로 정의해야 한다 (RESULTS_DIRPRED §3).
+- ★ (HOLDPRED 이후) **S1 은 사실상 실행됐다** = `56_planopt.py`(PRE 앙상블 CEM) + 재생. 학습 물체에서 +.10 이 나왔으니 다음은 **형상 일반화**:
+  (a) 학습 물체 수를 늘린다(ours_M/L·union_ycb 로 PRE 재학습, 홀드아웃 이득이 CI>0 이 되는가), (b) PRE 입력에 손 상태 추가,
+  (c) Shadow 에서 plan 정보가 안 읽히는 원인(PRE-noplan ≈ PRE) 규명. 라벨은 α=8 Y_pose, 반복 ≥2 (Inspire corr(A,B) .42 — 3회 권장).
 
 ## 3. 데이터·산출물 (재생성 없이 쓸 수 있는 것)
 

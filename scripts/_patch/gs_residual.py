@@ -213,6 +213,141 @@ def _run(ppo_self):
                  zip(["+x", "-x", "+y", "-y", "+z", "-z"], h)), float(h.mean())), flush=True)
         raise SystemExit(0)
 
+    if _MODE == "dataset" and os.environ.get("GS_BR_OFFSET", "") == "posthold":
+        # ★ 파지 후(hold) 방향별 라벨 생성 — 설계 = docs/EXP_HOLDPRED.md.
+        #   장면마다 R 후보(12-D plan)를 같은 초기자세에서 굴리고, gs_branch posthold 창(t0 = lift+HOLD 에서
+        #   6방향 α·mg 램프 → LOAD → RECOVER)의 Y_hold / Y_pose 를 방향별로 읽는다.
+        #   특징 = ① t0 도달 시점의 hold 상태(priv_obs + palm 점군) ② t=0 실행 전(월드 점군·물체 자세·teacher edit·plan).
+        #   GS_DS_CANDS=<npz> 를 주면 후보·초기자세를 파일에서 읽는다 (최적화 계획의 물리 재생).
+        from isaacgym.torch_utils import quat_apply, quat_conjugate
+        import time as _time
+        n_obj = env._br_n_obj
+        R = n // n_obj
+        dp = 6 + env.num_active_hand_dofs
+        G = env._br_G
+        allenv = torch.arange(env.num_envs, device=dev)
+        EPS = int(os.environ.get("GS_DS_EPS", "40") or 40)
+        NPTS = int(os.environ.get("GS_DS_NPTS", "256") or 256)
+        SIGS = [float(x) for x in os.environ.get("GS_DS_SIGS", "0.05,0.10,0.20").split(",") if x.strip()]
+        NREP = int(os.environ.get("GS_DS_REPS", "2") or 2)
+        CANDS = os.environ.get("GS_DS_CANDS", "")
+        CZ = np.load(CANDS) if CANDS else None
+        if CZ is not None:
+            EPS = int(CZ["p0_obj"].shape[0])
+        n_hand = int(env.num_active_hand_dofs); n_ft = int(env.fingertip_pos.shape[1])
+        n_cf = int(env.contact_force_sensors.shape[1])
+        EP_END_MAX, DZ_END_MIN, EP_MAX_MAX, ER_MAX_MAX = 0.05, 0.05, 0.02, float(np.deg2rad(15.0))
+        slot = (torch.arange(n, device=dev) // n_obj)
+        sig_of = torch.tensor([0.0] + [SIGS[(i - 1) % len(SIGS)] for i in range(1, R)], dtype=torch.float, device=dev)
+        ar = torch.arange(n, device=dev)
+        probe_idx = torch.stack([(2 + d_) * n + ar for d_ in range(6)], 0)      # [6, n] 방향별 probe env
+        ctrl_idx = n + ar
+        ST = {k: [] for k in ("obs0", "pcl0", "cap0", "t0", "pre_pcl", "pre_q", "pre_p", "teach", "plan",
+                              "obj", "slot", "sig", "scene")}
+        P0 = []
+        LB = [{k: [] for k in ("g0", "yhold", "ypose", "done", "ep_max", "eR_max", "ep_end", "dz_end",
+                               "ctrl_hold", "ctrl_pose", "succ")} for _ in range(NREP)]
+        print("[res] DATASET-POSTHOLD  n_obj=%d R=%d G=%d eps=%d dp=%d npts=%d sigs=%s reps=%d din=%d n_hand=%d n_ft=%d n_cf=%d cands=%s"
+              % (n_obj, R, G, EPS, dp, NPTS, SIGS, NREP, din, n_hand, n_ft, n_cf, CANDS or "-"), flush=True)
+
+        def _sub(pc):
+            st = max(1, pc.shape[1] // NPTS)
+            return pc[:, ::st][:, :NPTS]
+
+        def _snap(mask, fo_, fp_):
+            fo_[mask] = priv_obs(env)[mask]
+            if hasattr(env, "transformed_pcl"):
+                pc = _sub(env.transformed_pcl[:n]); k = pc.shape[1]
+                q = quat_conjugate(env.palm_rot[:n]).unsqueeze(1).expand(-1, k, -1)
+                pcp = quat_apply(q.reshape(-1, 4), (pc - env.palm_pos[:n].unsqueeze(1)).reshape(-1, 3)).reshape(n, k, 3)
+                fp_[mask, :k] = pcp[mask]
+
+        t0_ = _time.time()
+        for ep in range(EPS):
+            if CZ is not None:
+                p0o = torch.tensor(CZ["p0_obj"][ep], dtype=torch.float, device=dev)          # [n_obj, 7]
+                p0 = p0o.repeat(int(np.ceil(env.num_envs / n_obj)), 1)[:env.num_envs]
+            else:
+                env.reset_idx(allenv)
+                p0 = env.root_state_tensor[env.object_indices, 0:7].clone()
+                p0 = p0[:n_obj].repeat(int(np.ceil(env.num_envs / n_obj)), 1)[:env.num_envs]
+            p0np = p0.cpu().numpy()
+            cur = env.reset_idx(allenv, object_init_pose=p0np)["obs"]
+            with torch.no_grad():
+                teach = ppo_self.actor_critic(cur, env.get_state(), inference=True)[:, :dp].clone()
+            base = teach[:n_obj].repeat(R, 1)
+            if CZ is not None:
+                cand = torch.tensor(CZ["plan"][ep], dtype=torch.float, device=dev)[:n]
+            else:
+                cand = (base + sig_of[slot].unsqueeze(-1) * torch.randn(n, dp, device=dev)).clamp(-1, 1)
+                cand[:n_obj] = teach[:n_obj]
+            for rep in range(NREP):
+                env.reset_idx(allenv, object_init_pose=p0np)
+                if rep == 0:
+                    # 실행 전 특징: 월드 점군(물체 중심 기준) · 물체 자세
+                    pcw = _sub(env.transformed_pcl[:n]) if hasattr(env, "transformed_pcl") else torch.zeros(n, NPTS, 3, device=dev)
+                    pre_pcl = pcw - env.object_pos[:n].unsqueeze(1)
+                    pre_q = env.object_rot[:n].clone(); pre_p = env.object_pos[:n].clone()
+                plan = torch.zeros(env.num_envs, dp, device=dev)
+                plan[:n] = cand
+                env.generate_reaching_plan_idx(allenv, actions=plan[env._br_src])
+                fo0 = torch.zeros(n, din, device=dev); fp0 = torch.zeros(n, NPTS, 3, device=dev)
+                got0 = torch.zeros(n, dtype=torch.bool, device=dev); t0rec = torch.full((n,), -1, dtype=torch.long, device=dev)
+                N_ = env.num_envs
+                mydone = torch.zeros(N_, dtype=torch.bool, device=dev)
+                ep_end = torch.full((N_,), float("nan"), device=dev); dz_end = torch.full((N_,), float("nan"), device=dev)
+                ep_max = torch.full((N_,), float("nan"), device=dev); eR_max = torch.full((N_,), float("nan"), device=dev)
+                g0 = torch.zeros(n, dtype=torch.bool, device=dev)
+                for t in range(T):
+                    env.step(env.compute_reference_actions())
+                    g0 |= env._ph_g0[:n]
+                    if rep == 0:
+                        new0 = (env._ph_t0m >= 0) & (~got0)
+                        if bool(new0.any()):
+                            _snap(new0, fo0, fp0); t0rec[new0] = env._ph_t0m[new0]; got0 |= new0
+                    nd = env._ph_done & (~mydone)
+                    if bool(nd.any()):
+                        ep_end[nd] = env._ph_ep_end[nd]; dz_end[nd] = env._ph_dz_end[nd]
+                        ep_max[nd] = env._ph_ep_max[nd]; eR_max[nd] = env._ph_eR_max[nd]
+                        mydone |= nd
+                yh_all = mydone & (ep_end <= EP_END_MAX) & (dz_end > DZ_END_MIN)
+                yp_all = yh_all & (ep_max <= EP_MAX_MAX) & (eR_max <= ER_MAX_MAX)
+                L = LB[rep]
+                L["g0"].append(g0.float().cpu().numpy())
+                L["yhold"].append(yh_all[probe_idx].float().T.cpu().numpy())
+                L["ypose"].append(yp_all[probe_idx].float().T.cpu().numpy())
+                L["done"].append(mydone[probe_idx].float().T.cpu().numpy())
+                L["ep_max"].append(ep_max[probe_idx].T.cpu().numpy()); L["eR_max"].append(eR_max[probe_idx].T.cpu().numpy())
+                L["ep_end"].append(ep_end[probe_idx].T.cpu().numpy()); L["dz_end"].append(dz_end[probe_idx].T.cpu().numpy())
+                L["ctrl_hold"].append(yh_all[ctrl_idx].float().cpu().numpy()); L["ctrl_pose"].append(yp_all[ctrl_idx].float().cpu().numpy())
+                L["succ"].append((env.successes[:n] > 0.5).float().cpu().numpy())
+                if rep == 0:
+                    ST["obs0"].append(fo0.cpu().numpy()); ST["pcl0"].append(fp0.cpu().numpy().astype(np.float16))
+                    ST["cap0"].append(got0.cpu().numpy().astype(np.int32)); ST["t0"].append(t0rec.cpu().numpy().astype(np.int32))
+                    ST["pre_pcl"].append(pre_pcl.cpu().numpy().astype(np.float16)); ST["pre_q"].append(pre_q.cpu().numpy()); ST["pre_p"].append(pre_p.cpu().numpy())
+                    ST["teach"].append(base.cpu().numpy()); ST["plan"].append(cand.cpu().numpy())
+                    ST["obj"].append(env._br_obj[:n].cpu().numpy().astype(np.int32)); ST["slot"].append(slot.cpu().numpy().astype(np.int32))
+                    ST["sig"].append(sig_of[slot].cpu().numpy()); ST["scene"].append(np.full(n, ep, dtype=np.int32))
+                    P0.append(p0np[:n_obj].copy())
+            el = _time.time() - t0_
+            yh = LB[0]["yhold"][-1]; d_ = LB[0]["done"][-1] > 0
+            print("[res] ep %3d/%d  g0=%.3f done6=%.3f ctrlHold=%.3f | yhold/dir %s | ypose/dir %s | poseAll6=%.3f  %.0fs (%.1fs/ep, ETA %.0fm)"
+                  % (ep + 1, EPS, float(LB[0]["g0"][-1].mean()), float(d_.all(1).mean()), float(np.nanmean(LB[0]["ctrl_hold"][-1][LB[0]["g0"][-1] > 0])) if (LB[0]["g0"][-1] > 0).any() else float("nan"),
+                     " ".join("%.2f" % v for v in np.nanmean(np.where(d_, yh, np.nan), 0)),
+                     " ".join("%.2f" % v for v in np.nanmean(np.where(d_, LB[0]["ypose"][-1], np.nan), 0)),
+                     float(np.nanmean(np.where(d_.all(1), LB[0]["ypose"][-1].min(1), np.nan))),
+                     el, el / (ep + 1), (EPS - ep - 1) * el / (ep + 1) / 60.0), flush=True)
+            if (ep + 1) % 5 == 0 or ep == EPS - 1:
+                d = {k: np.concatenate(v, 0) for k, v in ST.items()}
+                d.update(p0_obj=np.stack(P0, 0), meta_nhand=n_hand, meta_nft=n_ft, meta_ncf=n_cf, meta_R=R, meta_nobj=n_obj,
+                         meta_alpha=float(os.environ.get("GS_BR_ALPHA", "8")))
+                for r in range(NREP):
+                    for k, v in LB[r].items():
+                        d["%s_%s" % (k, "ABCDE"[r])] = np.concatenate(v, 0)
+                np.savez_compressed(os.path.join(out, "data.npz"), **d)
+        print("[res] saved", os.path.join(out, "data.npz"), flush=True)
+        raise SystemExit(0)
+
     if _MODE == "dataset":
         # ★ critic 컨셉 검증용 라벨 생성 — 설계 = docs/EXP_CRITIC.md
         #   장면마다 R 개 후보(12-D plan)를 **같은 장면에서** 굴리고 6방향 버팀 카운트(0~6)를 라벨로 덤프.
