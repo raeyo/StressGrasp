@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # POSTRES — 폐합 후 상수 Δ 의 가동범위 측정. 설계 = docs/EXP_POSTRES.md.
-# usage: GS_GPU=0 GS_HAND=shadow_simple bash scripts/58_postres.sh <tag> [episodes]
+# usage: GS_GPU=0 GS_HAND=shadow_simple bash scripts/postres_run.sh <tag> [episodes]
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"; gs_check >/dev/null
 GS_PATCH2="$(cd "$(dirname "${BASH_SOURCE[0]}")/_patch2" && pwd)"

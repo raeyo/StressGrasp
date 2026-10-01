@@ -1,7 +1,7 @@
 # RESULTS — 폐합 후(post-closure) 수정의 가동범위 (POSTRES) · 판독 (2026-09-30)
 
 > 사전등록 = [`EXP_POSTRES.md`](EXP_POSTRES.md) (임계는 측정 전 커밋 `6495907` 에 고정) · 수치 = `../results/postres_pr_{shadow,inspire}__kimm.json`
-> 원시 = `runs/postres/pr_*/data.npz` (레포 밖). 워크스페이스 = kimm-h200, 브랜치 `kimm/postres`. 하니스 = `scripts/_patch2/gs_postres.py` + `scripts/58_postres.sh` · 판정 = `scripts/59_postres_gain.py`.
+> 원시 = `runs/postres/pr_*/data.npz` (레포 밖). 워크스페이스 = kimm-h200, 브랜치 `kimm/postres`. 하니스 = `scripts/_patch2/gs_postres.py` + `scripts/postres_run.sh` · 판정 = `scripts/postres_gain.py`.
 > 선행 = [`METHOD.md`](METHOD.md) §2·§3-3 · [`RESULTS_RESIDUAL.md`](RESULTS_RESIDUAL.md) · [`RESULTS_HOLDPRED.md`](RESULTS_HOLDPRED.md)
 
 ## 0. 한 줄

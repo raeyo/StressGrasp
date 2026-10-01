@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """POSTRES 판정 — 폐합 후 상수 Δ 의 가동범위. 설계·임계 = docs/EXP_POSTRES.md §4 (측정 전 고정).
-usage: python3 scripts/59_postres_gain.py --tag pr_shadow --hand shadow --data runs/postres/pr_shadow/data.npz
+usage: python3 scripts/postres_gain.py --tag pr_shadow --hand shadow --data runs/postres/pr_shadow/data.npz
 지표 = R_all_pose (g0 ∧ 6방향 done ∧ 6방향 Y_pose 전부) — 57_gain.py 와 같은 정의.
 """
 import os, json, argparse, numpy as np
